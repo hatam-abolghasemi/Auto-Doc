@@ -1,0 +1,93 @@
+---
+- name: Define tool definitions
+  set_fact:
+    tool_definitions:
+      - name: ansible
+        cmd: "ansible --version 2>/dev/null | head -n1 | sed -E 's/.*core ([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/'"
+      - name: containerd
+        cmd: "containerd --version 2>&1 | head -n1 | sed -E 's/.* v?([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/'"
+      - name: coredns
+        cmd: "coredns -version 2>/dev/null | awk -F'-' '/^CoreDNS/ {print $2}'"
+      - name: docker
+        cmd: "docker version | awk '/Version:/ {print $2; exit}'"
+      - name: filebeat
+        cmd: "filebeat version | cut -d' ' -f3"
+      - name: gitlab-runner
+        cmd: "gitlab-runner -v | awk '/Version:/ {print $2}'"
+      - name: haproxy
+        cmd: "haproxy -v 2>&1 | head -n1 | sed -E 's/^HAProxy version ([0-9]+.[0-9]+.[0-9]+).*/\\1/'"
+      - name: k3s
+        cmd: "k3s -v 2>&1 | head -n1 | awk '{print $3}' | sed 's/v//' | cut -d'+' -f1"
+      - name: kubernetes
+        cmd: "kubelet --version 2>&1 | head -n1 | sed -E 's/^Kubernetes v([0-9]+.[0-9]+.[0-9]+).*/\\1/'"
+      - name: nginx
+        cmd: "nginx -v 2>&1 | head -n1 | cut -d'/' -f2 | cut -d' ' -f1"
+      - name: rabbitmq
+        cmd: "rabbitmqctl version 2>/dev/null | head -n1"
+      - name: telegraf
+        cmd: "telegraf version 2>/dev/null | cut -d' ' -f2"
+      - name: teleport
+        cmd: "teleport version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/v//'"
+      - name: zabbix_agent2
+        cmd: "zabbix_agent2 --version 2>/dev/null | grep -E '^zabbix_agent2' | sed -E 's/.*\\) ([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/'"
+- name: Check binary tools on target (Strict RAW)
+  raw: |
+    T_NAME={{ item.name | quote }}
+    T_CMD={{ item.cmd | quote }}
+    T_PATH=$(which "$T_NAME" 2>/dev/null)
+    if [ -n "$T_PATH" ]; then
+        S_NAME="$T_NAME"
+        [ "$T_NAME" = "zabbix_agent2" ] && S_NAME="zabbix-agent2"
+        [ "$T_NAME" = "kubernetes" ] && S_NAME="kubelet"
+        T_VER=$(eval "$T_CMD" | tr -d '\r\n')
+        T_STATE=$(systemctl is-active "$S_NAME" 2>/dev/null | head -n1 || echo "not-found")
+        T_ENBL=$(systemctl is-enabled "$S_NAME" 2>/dev/null | head -n1 || echo "not-found")
+        T_MGR="standalone"
+        dpkg -S "$T_PATH" >/dev/null 2>&1 && T_MGR="apt"
+        T_PORTS=$(ss -ntlp 2>/dev/null | grep -E "\"$T_NAME\"|:$T_NAME |\"$S_NAME\"|:$S_NAME " | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        [ -z "$T_PORTS" ] && T_PORTS="none"
+        printf "%s|%s|%s|%s|%s|%s|%s\n" "$T_NAME" "$T_VER" "$T_PATH" "$T_MGR" "$T_STATE" "$T_ENBL" "$T_PORTS"
+    fi
+  register: tool_check
+  loop: "{{ tool_definitions }}"
+  failed_when: false
+  changed_when: false
+
+- name: Initialize empty tools list
+  set_fact:
+    host_tools_list: []
+
+- name: Process tool results
+  set_fact:
+    host_tools_list: >-
+      {{ host_tools_list + [{
+        "target_name": target_name,
+        "target_ip": ansible_host,
+        "tool_name": (item.stdout | trim | split('|'))[0],
+        "tool_version": (item.stdout | trim | split('|'))[1],
+        "tool_path": (item.stdout | trim | split('|'))[2],
+        "tool_manager": (item.stdout | trim | split('|'))[3],
+        "tool_status": (item.stdout | trim | split('|'))[4],
+        "tool_enabled": (item.stdout | trim | split('|'))[5],
+        "tool_ports": (item.stdout | trim | split('|'))[6]
+      }] }}
+  when: 
+    - item.stdout is defined 
+    - item.stdout | trim != ""
+    - (item.stdout | trim | split('|') | length) == 7
+  loop: "{{ tool_check.results }}"
+
+- name: Generate tools JSON
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  copy:
+    dest: outputs/tools.json
+    content: >-
+      {{ ansible_play_hosts_all 
+         | map('extract', hostvars, 'host_tools_list') 
+         | flatten 
+         | select('defined')
+         | list 
+         | to_nice_json(indent=4) }}
+    force: yes

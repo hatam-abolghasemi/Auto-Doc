@@ -1,0 +1,51 @@
+---
+- name: Get running docker metadata with Comma-Separated Mappings (Target)
+  raw: |
+    {% raw %}
+    which docker >/dev/null && docker ps --filter "status=running" --format "{{.ID}}|{{.Image}}|{{.Names}}|{{.Ports}}|{{.Networks}}" | while read line; do
+      id=$(echo "$line" | cut -d'|' -f1)
+      mounts=$(docker inspect "$id" --format '{{range $i, $value := .Mounts}}{{if $i}},{{end}}{{.Source}}:{{.Destination}}{{end}}')
+      [ -z "$mounts" ] && mounts="none"
+      echo "$line|$mounts"
+    done
+    {% endraw %}
+  register: docker_raw
+  failed_when: false
+  changed_when: false
+
+- name: Initialize empty images list
+  set_fact:
+    host_images_list: []
+
+- name: Process docker lines into facts
+  set_fact:
+    host_images_list: >-
+      {{ host_images_list + [{
+        "target_name": target_name,
+        "target_ip": ansible_host,
+        "docker_image": (item | split('|'))[1],
+        "docker_container_name": (item | split('|'))[2],
+        "docker_ports": (item | split('|'))[3] if (item | split('|'))[3] | trim != "" else "none",
+        "docker_networks": (item | split('|'))[4],
+        "docker_mount_mappings": (item | split('|'))[5] | trim
+      }] }}
+  loop: "{{ docker_raw.stdout_lines }}"
+  when: 
+    - docker_raw.rc == 0
+    - item | trim != ""
+    - (item | split('|') | length) >= 6
+
+- name: Generate docker JSON (Local)
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  copy:
+    dest: outputs/docker.json
+    content: >-
+      {{ ansible_play_hosts_all 
+         | map('extract', hostvars, 'host_images_list') 
+         | flatten 
+         | select('defined')
+         | list
+         | to_nice_json(indent=4) }}
+    force: yes

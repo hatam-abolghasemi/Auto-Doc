@@ -1,0 +1,47 @@
+---
+- name: Find all JSON files in the outputs directory
+  delegate_to: localhost
+  ansible.builtin.find:
+    paths: "{{ playbook_dir }}/outputs"
+    patterns: "*.json"
+    excludes: "merge.json"
+  register: json_files
+
+- name: Read and combine all JSON contents
+  delegate_to: localhost
+  set_fact:
+    all_raw_data: "{{ all_raw_data | default([]) + lookup('file', item.path) | from_json }}"
+  loop: "{{ json_files.files }}"
+
+- name: Group and merge data by Target IP and Target Name
+  delegate_to: localhost
+  set_fact:
+    merged_data: >-
+      {%- set results = {} -%}
+      {%- for entry in all_raw_data -%}
+        {%- set key = entry.target_ip ~ '::' ~ entry.target_name -%}
+        {%- set existing_obj = results.get(key, {}) -%}
+        {%- set updated_obj = {'target_ip': entry.target_ip, 'target_name': entry.target_name} -%}
+        {%- set all_keys = (existing_obj.keys() | list) + (entry.keys() | list) -%}
+        {%- for k in all_keys | unique -%}
+          {%- if k not in ['target_ip', 'target_name'] -%}
+            {%- set val1 = existing_obj.get(k, '') | string -%}
+            {%- set val2 = entry.get(k, '') | string -%}
+            {%- if val1 and val2 and val1 != val2 -%}
+              {%- set combined = (val1.split(',') + val2.split(',')) | unique | join(',') -%}
+              {%- set _ = updated_obj.update({k: combined}) -%}
+            {%- else -%}
+              {%- set _ = updated_obj.update({k: val1 if val1 else val2}) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set _ = results.update({key: updated_obj}) -%}
+      {%- endfor -%}
+      {{ results.values() | list | to_json }}
+
+- name: Write the final merge.json
+  delegate_to: localhost
+  ansible.builtin.copy:
+    content: "{{ merged_data | from_json | to_nice_json }}"
+    dest: "{{ playbook_dir }}/outputs/merge.json"
+    mode: '0644'

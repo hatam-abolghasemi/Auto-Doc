@@ -1,0 +1,71 @@
+---
+- name: "Get Storage metadata (Primary Source: /proc/mounts)"
+  raw: |
+    grep -E '^/|^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:|^[a-zA-Z0-9\.-]+:/' /proc/mounts | grep -vE "^/dev/loop|/var/lib/kubelet/pods" | awk '{print $1 "|" $2 "|" $3}' | while read -r line; do
+      src=$(echo "$line" | cut -d'|' -f1)
+      mnt=$(echo "$line" | cut -d'|' -f2)
+      typ=$(echo "$line" | cut -d'|' -f3)
+      siz=$(df -B1 "$mnt" --output=size 2>/dev/null | tail -n1 | tr -d ' ' || echo "0")
+      lsblk_data=$(lsblk -pb -n -d -o NAME,TYPE,KNAME,VENDOR,MODEL,RO,TRAN -P "$src" 2>/dev/null | head -n1)
+      if [ -n "$lsblk_data" ]; then eval "$lsblk_data"; fi
+      knam_val="$KNAME"
+      [ -z "$knam_val" ] && knam_val="$src"
+      knam_short=$(echo "$knam_val" | sed 's|/dev/||;s|/dev/mapper/||')
+      if [ -d "/sys/block/$knam_short/slaves" ]; then
+        slave_dev=$(ls "/sys/block/$knam_short/slaves" | head -n1)
+        [ -n "$slave_dev" ] && knam_short="$slave_dev"
+      fi
+      base_dev=$(echo "$knam_short" | sed -E 's/p?[0-9]+$//')
+      sys_path="/sys/block/$base_dev"
+      vend_val="$VENDOR"; [ -z "$vend_val" ] && vend_val="unknown"
+      [ "$vend_val" = "unknown" ] && [ -f "$sys_path/device/vendor" ] && vend_val=$(cat "$sys_path/device/vendor" | tr -d '[:space:]|')
+      modl_val="$MODEL"; [ -z "$modl_val" ] && modl_val="unknown"
+      [ "$modl_val" = "unknown" ] && [ -f "$sys_path/device/model" ] && modl_val=$(cat "$sys_path/device/model" | sed 's/^[ \t]*//;s/[ \t]*$//' | tr '|' '-')
+      trans_val="$TRAN"; [ -z "$trans_val" ] && trans_val="unknown"
+      [ "$trans_val" = "unknown" ] && [ -d "$sys_path/device/scsi_device" ] && trans_val="sata/scsi"
+      [ "$trans_val" = "unknown" ] && [[ "$base_dev" == nvme* ]] && trans_val="nvme"
+      [ "$trans_val" = "unknown" ] && [[ "$base_dev" == vda* ]] && trans_val="virtio"
+      ro_val="$RO"; [ -z "$ro_val" ] && ro_val="0"
+      [ "$ro_val" = "0" ] && [ -f "$sys_path/ro" ] && ro_val=$(cat "$sys_path/ro")
+      stype_val="$TYPE"; [ -z "$stype_val" ] && stype_val="disk"
+      if [[ "$src" == *rbd* ]]; then
+        vend_val="Ceph"; modl_val="RADOS Block Device"; trans_val="network/rbd"; stype_val="disk"
+      elif [[ "$typ" == nfs* || "$typ" == ceph || "$typ" == cifs ]]; then
+        vend_val="network_vendor"; modl_val="remote_share"; trans_val="ethernet"; stype_val="network_mount"
+      fi
+      [ -z "$vend_val" ] && vend_val="unknown"
+      [ -z "$modl_val" ] && modl_val="unknown"
+      printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$mnt" "$src" "$typ" "$siz" "$stype_val" "$modl_val" "$vend_val" "$trans_val" "$ro_val"
+    done
+  register: storage_raw
+  changed_when: false
+
+- name: "Create facts for storage"
+  set_fact:
+    host_storage_list: >-
+      {{ host_storage_list | default([]) + [{
+        "target_name": target_name,
+        "target_ip": ansible_host,
+        "storage_mountpoint": (item.split('|'))[0],
+        "storage_device_name": (item.split('|'))[1],
+        "storage_fstype": (item.split('|'))[2],
+        "storage_size_bytes": (item.split('|'))[3],
+        "storage_type": (item.split('|'))[4],
+        "storage_model": (item.split('|'))[5],
+        "storage_vendor": (item.split('|'))[6],
+        "storage_transport": (item.split('|'))[7],
+        "storage_read_only": (item.split('|'))[8]
+      }] }}
+  loop: "{{ storage_raw.stdout_lines }}"
+  when: 
+    - item | trim != ""
+    - (item.split('|') | length) == 9
+
+- name: "Generate storage JSON"
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/outputs/storage.json"
+    content: "{{ ansible_play_hosts_all | map('extract', hostvars, 'host_storage_list') | flatten | select('defined') | list | to_nice_json(indent=4) }}"
+    force: yes

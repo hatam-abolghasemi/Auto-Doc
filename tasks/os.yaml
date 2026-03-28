@@ -1,0 +1,56 @@
+---
+- name: Get detailed OS metadata with full version and codename (Target)
+  raw: |
+    if [ -f /etc/os-release ]; then . /etc/os-release; fi
+    full_ver=$(echo "$VERSION" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    full_codename=$(echo "$VERSION" | sed -E 's/.*\((.*)\).*/\1/')
+    if command -v aa-status >/dev/null 2>&1; then
+      sec_status=$(aa-status --enabled && echo "apparmor-enabled" || echo "apparmor-disabled")
+    elif command -v getenforce >/dev/null 2>&1; then
+      sec_status="selinux-$(getenforce | tr '[:upper:]' '[:lower:]')"
+    else
+      sec_status="none"
+    fi
+    if command -v apt >/dev/null 2>&1; then pkg="apt"; elif command -v dnf >/dev/null 2>&1; then pkg="dnf"; elif command -v yum >/dev/null 2>&1; then pkg="yum"; else pkg="unknown"; fi
+    arch=$(uname -m)
+    k_rel=$(uname -r)
+    k_ver=$(uname -v)
+    m_id=$(cat /etc/machine-id 2>/dev/null || echo "unknown")
+    t_zone=$(cat /etc/timezone 2>/dev/null || timedatectl | grep "Time zone" | awk '{print $3}' || echo "unknown")
+    printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+      "${ID:-unknown}" "$full_ver" "$full_codename" "$arch" "$k_rel" "$k_ver" \
+      "$m_id" "$t_zone" "$pkg" "$sec_status"
+  register: os_details_raw
+  changed_when: false
+
+- name: Create fact for this host's OS data
+  vars:
+    os: "{{ os_details_raw.stdout | trim | split('|') }}"
+  set_fact:
+    host_os_info:
+      target_name: "{{ target_name }}"
+      target_ip: "{{ ansible_host }}"
+      os_name: "{{ os[0] }}"
+      os_version: "{{ os[1] }}"
+      os_codename: "{{ os[2] }}"
+      os_architecture: "{{ os[3] }}"
+      os_kernel_release: "{{ os[4] }}"
+      os_kernel_version: "{{ os[5] }}"
+      os_machine_id: "{{ os[6] }}"
+      os_timezone: "{{ os[7] }}"
+      os_package_manager: "{{ os[8] }}"
+      os_selinux_apparmor_status: "{{ os[9] }}"
+
+- name: Generate OS JSON (Local)
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/outputs/os.json"
+    content: >-
+      {{ ansible_play_hosts_all 
+         | map('extract', hostvars, 'host_os_info') 
+         | select('defined')
+         | list 
+         | to_nice_json(indent=4) }}
+    force: yes

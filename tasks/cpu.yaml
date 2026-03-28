@@ -1,0 +1,67 @@
+---
+- name: Gather advanced CPU details with specific Virtualization fields (Target)
+  raw: |
+    lscpu | awk -F': +' '
+    $1 == "Vendor ID" {v=$2}
+    $1 == "BIOS Vendor ID" {bv=$2}
+    $1 ~ /^Model name/ {m=$2}
+    $1 ~ /BIOS Model name/ {bm=$2}
+    $1 ~ /^CPU family/ {f=$2}
+    $1 ~ /BIOS CPU family/ {bf=$2}
+    $1 == "Model" {mn=$2}
+    $1 == "Architecture" {a=$2}
+    $1 == "Thread(s) per core" {threads=$2}
+    $1 == "Core(s) per socket" {cores_per_socket=$2}
+    $1 == "Socket(s)" {sockets=$2}
+    $1 == "NUMA node(s)" {n=$2}
+    $1 ~ /Hypervisor vendor/ {hv=$2}
+    $1 ~ /Virtualization type/ {vt=$2}
+    $1 == "Virtualization" {vfeat=$2}
+    END {
+      logical = "'$(nproc)'";
+      physical = (sockets * cores_per_socket);
+      is_vm = (hv != "" || vfeat ~ /hypervisor/) ? "true" : "false";
+      numa_active = (n > 1) ? "true" : "false";
+      printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", v,bv,m,bm,f,bf,mn,a,logical,physical,sockets,threads,n,numa_active,is_vm,hv,vt
+    }'
+  register: cpu_raw
+  changed_when: false
+
+- name: Create fact for this host's data
+  vars:
+    stats: "{{ cpu_raw.stdout | trim | split('|') }}"
+  set_fact:
+    host_cpu_info:
+      target_name: "{{ target_name }}"
+      target_ip: "{{ ansible_host }}"
+      cpu_vendor_id: "{{ stats[0] | default('unknown') }}"
+      cpu_bios_vendor_id: "{{ stats[1] | default('none') }}"
+      cpu_model_name: "{{ stats[2] | default('unknown') }}"
+      cpu_bios_model_name: "{{ stats[3] | default('none') }}"
+      cpu_family: "{{ stats[4] | default('unknown') }}"
+      cpu_bios_family: "{{ stats[5] | default('none') }}"
+      cpu_model_number: "{{ stats[6] | default('unknown') }}"
+      cpu_arch: "{{ stats[7] | default('unknown') }}"
+      cpu_logical_processors: "{{ stats[8] | default('0') | trim }}"
+      cpu_physical_cores: "{{ stats[9] | default('0') | trim }}"
+      cpu_sockets: "{{ stats[10] | default('0') | trim }}"
+      cpu_threads_per_core: "{{ stats[11] | default('0') | trim }}"
+      cpu_numa_nodes: "{{ stats[12] | default('1') | trim }}"
+      cpu_numa_enabled: "{{ stats[13] | default('false') }}"
+      cpu_is_virtual_machine: "{{ stats[14] | default('false') }}"
+      cpu_virt_hypervisor_vendor: "{{ stats[15] | default('none') | trim }}"
+      cpu_virt_virtualization_type: "{{ stats[16] | default('none') | trim }}"
+
+- name: Generate perfectly formatted CPU JSON (Local)
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/outputs/cpu.json"
+    content: >-
+      {{ ansible_play_hosts_all 
+         | map('extract', hostvars, 'host_cpu_info') 
+         | select('defined')
+         | list 
+         | to_nice_json(indent=4) }}
+    force: yes

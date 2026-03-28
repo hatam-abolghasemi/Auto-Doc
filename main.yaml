@@ -1,0 +1,25 @@
+---
+- name: Gather documentation data
+  hosts: all
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Create Component-Based View
+      include_tasks: "./tasks/{{ item }}.yaml"
+      loop:
+        - os
+        - cpu
+        - memory
+        - storage
+        - network
+        - tools
+        - docker
+        # - backend
+        # - frontend
+# - name: Create All In One View
+#   hosts: localhost
+#   gather_facts: no
+#   become: no
+#   tasks:
+#     - name: Run merge playbook
+#       include_tasks: ./tasks/merge.yaml

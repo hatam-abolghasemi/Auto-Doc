@@ -1,0 +1,31 @@
+# it's just a schematic for now
+[
+  {
+    "backend_name": "",
+    "backend_language_name": "",
+    "backend_language_version": "",
+    "backend_framework_name": "",
+    "backend_framework_version": "",
+    "backend_dependency_manager_name": "",
+    "backend_dependency_manager_version": "",
+    "backend_mariadb": "",
+    "backend_mongodb": "",
+    "backend_redis": "",
+    "backend_rabbit": "",
+    "backend_kafka": "",
+    "backend_queue": "",
+    "backend_cronjob": ""
+  }
+]
+[
+  {
+    "backend_name": "",
+    "backend_inter_dependency": ""
+  }
+]
+[
+  {
+    "backend_name": "",
+    "backend_third_party_dependency": ""
+  }
+]

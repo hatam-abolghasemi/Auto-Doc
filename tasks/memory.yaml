@@ -1,0 +1,66 @@
+---
+- name: Get hardware memory metadata (Target)
+  become: yes
+  raw: |
+    dmidecode -t memory | awk -F': ' '
+    /Maximum Capacity:/ {cap=$2}
+    /Number Of Devices:/ {num=$2}
+    /Size:/ && !/No Module/ {s=$2}
+    /Form Factor:/ {f=$2}
+    /Type:/ && !/Type Detail/ {t=$2}
+    /Manufacturer:/ {m=$2}
+    END {
+      printf "%s|%s|%s|%s|%s|%s\n", cap,num,s,f,t,m
+    }'
+  register: mem_hw_raw
+  changed_when: false
+
+- name: Get logical memory block data (Target)
+  raw: |
+    lsmem | awk -F': +' '
+    /Memory block size/ {bs=$2}
+    /Total online memory/ {on=$2}
+    /Total offline memory/ {off=$2}
+    END {
+      printf "%s|%s|%s\n", bs,on,off
+    }'
+  register: mem_lsmem_raw
+  changed_when: false
+
+- name: Get kernel memory total (Target)
+  raw: grep MemTotal /proc/meminfo | awk '{print $2}'
+  register: mem_total_kb
+  changed_when: false
+
+- name: Create fact for this host's memory data
+  vars:
+    hw: "{{ mem_hw_raw.stdout | trim | split('|') }}"
+    ls: "{{ mem_lsmem_raw.stdout | trim | split('|') }}"
+  set_fact:
+    host_memory_info:
+      target_name: "{{ target_name }}"
+      target_ip: "{{ ansible_host }}"
+      memory_size_kb: "{{ mem_total_kb.stdout | trim }}"
+      memory_physical_memory_maximum_capacity: "{{ hw[0] | default('unknown') | trim }}"
+      memory_physical_memory_number_of_devices: "{{ hw[1] | default('unknown') | trim }}"
+      memory_memory_device_size: "{{ hw[2] | default('unknown') | trim }}"
+      memory_memory_device_form_factor: "{{ hw[3] | default('unknown') | trim }}"
+      memory_memory_device_type: "{{ hw[4] | default('unknown') | trim }}"
+      memory_memory_device_manufacturer: "{{ hw[5] | default('unknown') | trim }}"
+      memory_block_size: "{{ ls[0] | default('unknown') | trim }}"
+      memory_total_online_memory: "{{ ls[1] | default('unknown') | trim }}"
+      memory_total_offline_memory: "{{ ls[2] | default('unknown') | trim }}"
+
+- name: Generate perfectly formatted memory JSON (Local)
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir }}/outputs/memory.json"
+    content: >-
+      {{ ansible_play_hosts_all 
+         | map('extract', hostvars, 'host_memory_info') 
+         | select('defined')
+         | list 
+         | to_nice_json(indent=4) }}
+    force: yes
