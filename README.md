@@ -1,6 +1,6 @@
 # Auto-Doc: The Living CMDB & GitOps Documentation Engine
 
-**Auto-Doc** is a high-performance, agentless framework designed to automate the documentation of complex Linux ecosystems. By treating infrastructure and application metadata as version-controlled code, Auto-Doc transforms the nightmare of manual tracking into a dynamic, **GitOps-driven Source of Truth**.
+**Auto-Doc** is an agentless framework designed to automate the documentation of complex Linux ecosystems. By treating infrastructure and application metadata as version-controlled code, Auto-Doc transforms the nightmare of manual tracking into a dynamic, **GitOps-driven Source of Truth**.
 
 ## 💡 The Philosophy: "Infrastructure as Documentation"
 
