@@ -22,6 +22,7 @@
       physical = (sockets * cores_per_socket);
       is_vm = (hv != "" || vfeat ~ /hypervisor/) ? "true" : "false";
       numa_active = (n > 1) ? "true" : "false";
+      # Output: Vendor|BIOSVendor|Model|BIOSModel|Family|BIOSFamily|ModelNum|Arch|Logical|Physical|Sockets|Threads|NumaNodes|NumaActive|IsVM|HVVendor|VirtType
       printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", v,bv,m,bm,f,bf,mn,a,logical,physical,sockets,threads,n,numa_active,is_vm,hv,vt
     }'
   register: cpu_raw
@@ -34,6 +35,7 @@
     host_cpu_info:
       target_name: "{{ target_name }}"
       target_ip: "{{ ansible_host }}"
+      target_group: "{{ target_group }}"
       cpu_vendor_id: "{{ stats[0] | default('unknown') }}"
       cpu_bios_vendor_id: "{{ stats[1] | default('none') }}"
       cpu_model_name: "{{ stats[2] | default('unknown') }}"

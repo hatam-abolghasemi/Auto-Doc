@@ -1,0 +1,69 @@
+---
+- name: Check that jq is available on the control node
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.command: jq --version
+  register: jq_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if jq is missing on the control node
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.fail:
+    msg: "jq is required on the control node to build ip-inventory.json (sudo apt-get install -y jq)"
+  when: jq_check.rc != 0
+
+- name: Build subnet-based IP inventory from network.json (Local)
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.shell: |
+    jq '
+      # lookup: subnet -> { network_ip -> {name: target_name, group: target_group} }
+      (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: $e.target_group})) as $lookup
+
+      # per-subnet metadata: subnet string, key segment (3rd octet), base (first 3 octets)
+      | ($lookup | keys | sort) as $subnets
+      | [
+          $subnets[] as $s
+          | {
+              subnet: $s,
+              seg: ($s | split("/")[0] | split(".")[2]),
+              base: ($s | split("/")[0] | split(".")[0:3] | join("."))
+            }
+        ] as $meta
+
+      # one row per host octet 1..254, one ip/target_name/target_group triplet per subnet
+      | [
+          range(1; 255) as $host
+          | reduce $meta[] as $m (
+              {};
+              . + {
+                ("subnet_" + $m.seg + "_ip"): ($m.base + "." + ($host | tostring)),
+                ("subnet_" + $m.seg + "_target_name"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].name // "-"),
+                ("subnet_" + $m.seg + "_target_group"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].group // "-")
+              }
+            )
+        ]
+    ' outputs/network.json > outputs/ip-inventory.json
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Report ip-inventory row count
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.command: jq 'length' outputs/ip-inventory.json
+  register: ip_inventory_count
+  changed_when: false
+
+- name: Show ip-inventory summary
+  delegate_to: localhost
+  become: no
+  run_once: yes
+  ansible.builtin.debug:
+    msg: "Wrote {{ ip_inventory_count.stdout }} row(s) to outputs/ip-inventory.json"

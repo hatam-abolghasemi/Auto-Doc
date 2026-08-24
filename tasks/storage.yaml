@@ -46,6 +46,7 @@
       {{ host_storage_list | default([]) + [{
         "target_name": target_name,
         "target_ip": ansible_host,
+        "target_group": target_group,
         "storage_mountpoint": (item.split('|'))[0],
         "storage_device_name": (item.split('|'))[1],
         "storage_fstype": (item.split('|'))[2],
@@ -67,5 +68,12 @@
   run_once: yes
   ansible.builtin.copy:
     dest: "{{ playbook_dir }}/outputs/storage.json"
-    content: "{{ ansible_play_hosts_all | map('extract', hostvars, 'host_storage_list') | flatten | select('defined') | list | to_nice_json(indent=4) }}"
+    content: >-
+      {{
+        ansible_play_hosts_all
+        | map('extract', hostvars)
+        | map(attribute='host_storage_list', default=[])
+        | flatten
+        | to_nice_json(indent=4)
+      }}
     force: yes

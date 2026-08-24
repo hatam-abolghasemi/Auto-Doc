@@ -23,6 +23,7 @@
       {{ host_images_list + [{
         "target_name": target_name,
         "target_ip": ansible_host,
+        "target_group": target_group,
         "docker_image": (item | split('|'))[1],
         "docker_container_name": (item | split('|'))[2],
         "docker_ports": (item | split('|'))[3] if (item | split('|'))[3] | trim != "" else "none",

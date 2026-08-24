@@ -1,0 +1,17 @@
+services:
+  autodoc:
+    image: hatam-abolghasemi/json-exposer:1.0.0
+    container_name: autodoc
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./outputs:/app/confs:ro
+    networks:
+      - autodoc
+networks:
+  autodoc:
+    driver: bridge
+    name: autodoc
+
+

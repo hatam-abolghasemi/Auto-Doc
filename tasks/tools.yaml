@@ -10,6 +10,9 @@
         cmd: "coredns -version 2>/dev/null | awk -F'-' '/^CoreDNS/ {print $2}'"
       - name: docker
         cmd: "docker version | awk '/Version:/ {print $2; exit}'"
+      - name: elasticsearch
+        path: "/usr/share/elasticsearch/bin/elasticsearch"
+        cmd: "/usr/share/elasticsearch/bin/elasticsearch --version 2>/dev/null | sed -E 's/.*Version: ([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/'"
       - name: filebeat
         cmd: "filebeat version | cut -d' ' -f3"
       - name: gitlab-runner
@@ -18,12 +21,14 @@
         cmd: "haproxy -v 2>&1 | head -n1 | sed -E 's/^HAProxy version ([0-9]+.[0-9]+.[0-9]+).*/\\1/'"
       - name: k3s
         cmd: "k3s -v 2>&1 | head -n1 | awk '{print $3}' | sed 's/v//' | cut -d'+' -f1"
-      - name: kubernetes
+      - name: kubelet
         cmd: "kubelet --version 2>&1 | head -n1 | sed -E 's/^Kubernetes v([0-9]+.[0-9]+.[0-9]+).*/\\1/'"
       - name: nginx
         cmd: "nginx -v 2>&1 | head -n1 | cut -d'/' -f2 | cut -d' ' -f1"
       - name: rabbitmq
         cmd: "rabbitmqctl version 2>/dev/null | head -n1"
+      - name: redis-server
+        cmd: "redis-server --version | awk -F'[ =]' '{print $4}'"
       - name: telegraf
         cmd: "telegraf version 2>/dev/null | cut -d' ' -f2"
       - name: teleport
@@ -34,11 +39,14 @@
   raw: |
     T_NAME={{ item.name | quote }}
     T_CMD={{ item.cmd | quote }}
+    T_FALLBACK={{ (item.path | default('')) | quote }}
     T_PATH=$(which "$T_NAME" 2>/dev/null)
+    if [ -z "$T_PATH" ] && [ -n "$T_FALLBACK" ] && [ -x "$T_FALLBACK" ]; then
+        T_PATH="$T_FALLBACK"
+    fi
     if [ -n "$T_PATH" ]; then
         S_NAME="$T_NAME"
         [ "$T_NAME" = "zabbix_agent2" ] && S_NAME="zabbix-agent2"
-        [ "$T_NAME" = "kubernetes" ] && S_NAME="kubelet"
         T_VER=$(eval "$T_CMD" | tr -d '\r\n')
         T_STATE=$(systemctl is-active "$S_NAME" 2>/dev/null | head -n1 || echo "not-found")
         T_ENBL=$(systemctl is-enabled "$S_NAME" 2>/dev/null | head -n1 || echo "not-found")
@@ -63,6 +71,7 @@
       {{ host_tools_list + [{
         "target_name": target_name,
         "target_ip": ansible_host,
+        "target_group": target_group,
         "tool_name": (item.stdout | trim | split('|'))[0],
         "tool_version": (item.stdout | trim | split('|'))[1],
         "tool_path": (item.stdout | trim | split('|'))[2],
@@ -84,10 +93,12 @@
   copy:
     dest: outputs/tools.json
     content: >-
-      {{ ansible_play_hosts_all 
-         | map('extract', hostvars, 'host_tools_list') 
-         | flatten 
-         | select('defined')
-         | list 
-         | to_nice_json(indent=4) }}
+      {{
+        ansible_play_hosts_all
+        | map('extract', hostvars)
+        | map(attribute='host_tools_list', default=[])
+        | flatten
+        | list
+        | to_nice_json(indent=4)
+      }}
     force: yes

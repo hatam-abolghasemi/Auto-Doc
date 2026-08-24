@@ -1,115 +1,70 @@
-# Auto-Doc: The Living CMDB & GitOps Documentation Engine
+# Auto-Doc
 
-**Auto-Doc** is an agentless framework designed to automate the documentation of complex Linux ecosystems. By treating infrastructure and application metadata as version-controlled code, Auto-Doc transforms the nightmare of manual tracking into a dynamic, **GitOps-driven Source of Truth**.
+Auto-Doc is an Ansible playbook that discovers your servers and documents them automatically. It scans a subnet, finds every reachable machine, and writes out flat JSON files describing each one's OS, CPU, memory, storage, network, installed tools, Docker containers, and IPs.
 
-## 💡 The Philosophy: "Infrastructure as Documentation"
+## Features
 
-In large-scale environments, static documentation (Wikis, Spreadsheets, or rigid DCIM tools like NetBox) is always out of date. Auto-Doc solves this by:
+- **Auto-discovery** — give it subnets, it finds the machines. No inventory file to maintain by hand.
+- **Naming-agnostic grouping** — machines are grouped by stripping the trailing number off their hostname (e.g. `redis-01`, `redis-02` → group `redis`). No hardcoded role list to update.
+- **Correct static IP detection** — if a machine answers on more than one IP (a real static IP plus a floating one), Auto-Doc figures out which is the real one using netplan config, falling back to the default route, and flags anything it had to guess.
+- **One-run convergence** — discovery and documentation happen in a single `ansible-playbook` command. No second run needed to pick up new machines.
+- **Zero-footprint** — target machines need nothing but SSH and a shell. No Python, no agents.
+- **Read-only** — never modifies target machines. Only reads (`cat`, `grep`, `df`, `lsblk`, etc.).
+- **One file per topic** — each component (`os`, `cpu`, `docker`, ...) is its own task and its own output file, so you can add or update one without touching the rest.
+- **Consistent, sorted output** — every JSON file uses the same `<component>_<field>` naming, and hosts are listed in IP order.
+- **Grafana-ready** — the `outputs/` folder is plain JSON, built to be queried directly with Grafana's Infinity datasource.
 
-* **Universal Metadata Ingestor:** Document everything from physical hardware (`cpu_arch`) to dynamic application states (`backend_framework_version`) or storage topology (`storage_mountpoint`).
+## Project structure
 
-* **Zero-Footprint (Python-Less):** No prerequisites on target machines. If it has SSH and a shell or a CLI-command, it is documented.
-
-* **GitOps Audit Trail:** Every change, from an IP swap to a container update, is captured as a Git commit, providing a perfect historical record of your entire fleet.
-
-* **Visual Strategy:** Designed specifically for **Grafana** via the **Infinity Datasource**, allowing you to search, filter, and alert on documentation changes as easily as monitoring metrics.
-
-## 🛠 Project Structure
-
-```Plaintext
+```
 .
-├── hosts.yaml          # Inventory of your entire fleet (VMs, Bare-metal)
-├── main.yaml           # The Master Orchestrator
-├── tasks/              # Logic units (The "Collectors")
-│   ├── os.yaml         # OS-level metadata
-│   ├── docker.yaml     # Container & Image states
-│   ├── backend.yaml    # Application-specific versions/configs
-│   └── ...
-├── outputs/            # Flat JSON artifacts (The "Source of Truth")
-│   ├── cpu.json
-│   ├── storage.json
-│   └── ...
-└── README.md
+├── main.yaml            # runs discovery, then all the collectors
+├── ansible.cfg           # points the default inventory at hosts.yaml
+├── hosts.yaml            # output record only, not read as input
+├── tasks/
+│   ├── discover.yaml     # finds machines, resolves their static IP
+│   ├── os.yaml
+│   ├── cpu.yaml
+│   ├── memory.yaml
+│   ├── storage.yaml
+│   ├── network.yaml
+│   ├── tools.yaml
+│   ├── docker.yaml
+│   ├── ip-inventory.yaml
+│   └── merge.yaml
+└── outputs/               # the JSON files -- one per component
+    ├── os.json
+    ├── cpu.json
+    └── ...
 ```
 
-## 📐 Rules of Development
+## Running it
 
-To ensure the system remains scalable and the data remains clean for large number of machines, all contributions must follow these three mandates:
-
-### 1. Zero-Footprint (Python-Less)
-
-All data extraction must use the Ansible `raw` module.
-
-* **Requirement:** Target machines must not require Python or any pre-installed agents. They just need to be able to handle SSH connections or receive GET requests.
-
-* **Goal:** 100% compatibility across legacy, stripped-down, or hardened Linux distributions.
-
-### 2. Non-Invasive (Read-Only)
-
-**The "Look, Don't Touch" Rule:** Playbooks must never execute commands that modify the target system state.
-
-* **Mandate:** Only use "Read" commands (e.g., `cat`, `grep`, `lsblk`, `df`, `curl GET`).
-
-* **Restriction:** Strictly no `apt install`, `systemctl restart`, `rm`, or `POST/PUT` requests. Auto-Doc is a listener, not a configurator.
-
-### 3. Component Isolation (Atomic POVs)
-
-Each "Point of View" (POV) must be its own playbook in the `tasks/` directory.
-
-* **Structure:** `tasks/network.yaml` produces `outputs/network.json`.
-
-* **Reason:** This keeps logic maintainable and allows you to run specific documentation updates without taxing the entire network.
-
-### 4. Unique Namespacing
-
-Fields must be uniquely prefixed to prevent data collision when aggregating sources in Grafana.
-
-* **Format:** `<component>_<field_name>`
-
-* **Scalar vs. Multi-Value:**
-
-    * *Single-Value:* `{"cpu_physical_cores": 8}`
-
-    * *Multi-Value:* `{"storage_mountpoints": ""}` (Repeated entries times for a single `target_machine:target_ip` pair).
-
-* **Rule:** Before adding a field, search the `outputs/` directory to ensure the name is unique.
-
-## 🏃 Execution
-
-To run the **Auto-Doc** engine, your control node requires SSH access to the target fleet via **root** with **Public Key Authentication**. Root access is necessary to read restricted system metadata (e.g., `/proc` or Docker sockets) without interactive password prompts.
-
-### Run Command
-
-```Bash
-ansible-playbook -i hosts.yaml main.yaml -u root
+```bash
+ansible-playbook main.yaml
 ```
 
-### Prerequisites
+That's it — no `-i` flag needed. Subnets are set in the `subnets` var at the top of `main.yaml`.
 
-* **SSH Key-Based Auth:** Your public key must be in the `/root/.ssh/authorized_keys` of all target machines.
+What happens:
+1. `discover` scans those subnets, SSHes into whatever it finds, and figures out each machine's hostname, group, and real static IP.
+2. Those machines are used immediately by the rest of the same run — `os`, `cpu`, `memory`, `storage`, `network`, `tools`, `docker`, `ip-inventory` — each writing its own file to `outputs/`.
 
-* **Local Tools:** The control node requires `ansible` and `jq` installed to process and structure the metadata.
+## Prerequisites
 
-## 🔄 The GitOps Lifecycle
+- **SSH key-based root access** to every target machine.
+- **`ansible` and `jq`** installed on the control node.
 
-Auto-Doc is designed to run as a scheduled pipeline (e.g., a nightly GitLab CI job):
+## Adding a new field
 
-1. **Extract:** The pipeline runs `ansible-playbook` against the inventory.
+1. Pick the right task file (or create a new one in `tasks/`).
+2. Add a short raw shell command that reads the value.
+3. Prefix the field with `<component>_`, e.g. `cpu_physical_cores`.
+4. Check `outputs/` first to make sure the field name isn't already used.
 
-2. **Commit:** New JSON snapshots are committed back to the Git repository.
+## Why not NetBox or a spreadsheet?
 
-3. **Diff:** Any change in the JSON files represents a physical or configuration change in the infrastructure.
-
-4. **Expose:** The `outputs/` folder is served (via a simple json-exposer script) to a GET-able endpoint for any tool to consume.
-
-5. **Visualize:** Use the **Infinity Datasource** to create unified tables, joining different JSON files on the `hostname` key.
-
-## 📈 Why this over NetBox or Spreadsheets?
-
-* **Ease of Maintenance:** No database migrations, no unwanted fields, and no complex UI configurations.
-
-* **Total Flexibility:** Need to track a new field like `frontend_build_number`? Just add a 3-line shell command in a new task file.
-
-* **Data Portability:** Flat JSON is the "universal language." It is trivial to transform these artifacts into CSV, SQL, or Markdown reports later if needed.
-
-* **Unified Context:** See which machine has a specific IP or CPU count right next to your real-time performance graphs in Grafana.
+- No database, no UI to configure.
+- Adding a field is a 3-line shell command, not a migration.
+- Output is plain JSON — easy to convert to CSV, SQL, or a report.
+- Sits right next to your Grafana dashboards, on the same IP/hostname keys.

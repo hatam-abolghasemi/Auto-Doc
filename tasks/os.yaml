@@ -2,8 +2,14 @@
 - name: Get detailed OS metadata with full version and codename (Target)
   raw: |
     if [ -f /etc/os-release ]; then . /etc/os-release; fi
+    
+    # 1. Extract full version (e.g., 24.04.1) from VERSION string
     full_ver=$(echo "$VERSION" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    
+    # 2. Extract full Codename (e.g., Noble Numbat)
     full_codename=$(echo "$VERSION" | sed -E 's/.*\((.*)\).*/\1/')
+
+    # 3. Security Status logic
     if command -v aa-status >/dev/null 2>&1; then
       sec_status=$(aa-status --enabled && echo "apparmor-enabled" || echo "apparmor-disabled")
     elif command -v getenforce >/dev/null 2>&1; then
@@ -11,12 +17,18 @@
     else
       sec_status="none"
     fi
+
+    # 4. Determine Package Manager
     if command -v apt >/dev/null 2>&1; then pkg="apt"; elif command -v dnf >/dev/null 2>&1; then pkg="dnf"; elif command -v yum >/dev/null 2>&1; then pkg="yum"; else pkg="unknown"; fi
+
+    # 5. Gather remaining sys info
     arch=$(uname -m)
     k_rel=$(uname -r)
     k_ver=$(uname -v)
     m_id=$(cat /etc/machine-id 2>/dev/null || echo "unknown")
     t_zone=$(cat /etc/timezone 2>/dev/null || timedatectl | grep "Time zone" | awk '{print $3}' || echo "unknown")
+
+    # Output format: Name|FullVer|FullCode|Arch|KRel|KVer|MachID|TZone|Pkg|Sec
     printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
       "${ID:-unknown}" "$full_ver" "$full_codename" "$arch" "$k_rel" "$k_ver" \
       "$m_id" "$t_zone" "$pkg" "$sec_status"
@@ -30,6 +42,7 @@
     host_os_info:
       target_name: "{{ target_name }}"
       target_ip: "{{ ansible_host }}"
+      target_group: "{{ target_group }}"
       os_name: "{{ os[0] }}"
       os_version: "{{ os[1] }}"
       os_codename: "{{ os[2] }}"

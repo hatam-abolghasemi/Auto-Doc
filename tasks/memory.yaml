@@ -40,6 +40,7 @@
     host_memory_info:
       target_name: "{{ target_name }}"
       target_ip: "{{ ansible_host }}"
+      target_group: "{{ target_group }}"
       memory_size_kb: "{{ mem_total_kb.stdout | trim }}"
       memory_physical_memory_maximum_capacity: "{{ hw[0] | default('unknown') | trim }}"
       memory_physical_memory_number_of_devices: "{{ hw[1] | default('unknown') | trim }}"
