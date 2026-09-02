@@ -4,8 +4,13 @@
   connection: local
   gather_facts: no
   vars:
-    subnets: "192.168.212.0,192.168.213.0,192.168.214.0"
+    subnets: "192.168.104.0,192.168.200.0"
+    exclude_ips: []
   tasks:
+    - name: "Expose subnets to later plays via hostvars['localhost']"
+      set_fact:
+        fleet_subnets: "{{ subnets }}"
+
     - name: Build inventory from subnets
       include_tasks: "./tasks/discover.yaml"
 
@@ -13,24 +18,22 @@
   hosts: discovered_fleet
   become: yes
   gather_facts: no
+  ignore_unreachable: true
+  vars:
+    ansible_ssh_common_args: >-
+      -o ConnectTimeout=120
+      -o ConnectionAttempts=1
   tasks:
-    - name: Create Component-Based View
-      include_tasks: "./tasks/{{ item }}.yaml"
-      loop:
-        - os
-        - cpu
-        - memory
-        - storage
-        - network
-        - tools
-        - docker
-        - ip-inventory
-        # - backend
-        # - frontend
-# - name: Create All In One View
-#   hosts: localhost
-#   gather_facts: no
-#   become: no
-#   tasks:
-#     - name: Run merge playbook
-#       include_tasks: ./tasks/merge.yaml
+    - block:
+        - name: Create Component-Based View
+          include_tasks: "./tasks/{{ item }}.yaml"
+          loop:
+            - os
+            - cpu
+            - memory
+            - storage
+            - network
+            - tools
+            - docker
+            - ip-inventory
+      ignore_errors: true

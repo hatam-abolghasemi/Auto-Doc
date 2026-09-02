@@ -5,8 +5,9 @@
       src=$(echo "$line" | cut -d'|' -f1)
       mnt=$(echo "$line" | cut -d'|' -f2)
       typ=$(echo "$line" | cut -d'|' -f3)
-      siz=$(df -B1 "$mnt" --output=size 2>/dev/null | tail -n1 | tr -d ' ' || echo "0")
-      lsblk_data=$(lsblk -pb -n -d -o NAME,TYPE,KNAME,VENDOR,MODEL,RO,TRAN -P "$src" 2>/dev/null | head -n1)
+      siz=$(timeout -k 1 5 df -B1 "$mnt" --output=size 2>/dev/null | tail -n1 | tr -d ' ')
+      [ -z "$siz" ] && siz="0"
+      lsblk_data=$(timeout -k 1 5 lsblk -pb -n -d -o NAME,TYPE,KNAME,VENDOR,MODEL,RO,TRAN -P "$src" 2>/dev/null | head -n1)
       if [ -n "$lsblk_data" ]; then eval "$lsblk_data"; fi
       knam_val="$KNAME"
       [ -z "$knam_val" ] && knam_val="$src"
@@ -39,6 +40,7 @@
     done
   register: storage_raw
   changed_when: false
+  failed_when: false
 
 - name: "Create facts for storage"
   set_fact:

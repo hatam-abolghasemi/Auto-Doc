@@ -1,35 +1,4 @@
 ---
-# Discovers reachable hosts on the given subnets, SSHes into each to learn
-# its real hostname, groups them by stripping trailing numeric index tokens
-# off the hostname (naming-agnostic -- no hardcoded role vocabulary), and:
-#
-#   1. Writes hosts.yaml as a plain record/artifact (git history, Grafana,
-#      human reference). This file is NOT read back as inventory by this
-#      or any later run -- it is output only, always fully overwritten.
-#   2. Injects every discovered host into the CURRENT run's live in-memory
-#      inventory via add_host, into a group called "discovered_fleet"
-#      (plus its own naming-agnostic role group). The next play in
-#      main.yaml targets "discovered_fleet" directly, so the SAME run's
-#      subtasks operate on exactly what was just discovered -- no second
-#      invocation needed.
-#
-# Pure raw commands only (bash/awk/sed/grep/nmap/ssh/jq) -- no python
-# script involved, matching Auto-Doc's Zero-Footprint mandate. jq is
-# already a control-node prerequisite (see ip-inventory.yaml).
-#
-# subnets accepts bare network bases ("192.168.212.0") -- /24 is assumed
-# when no prefix is given -- or full CIDRs ("192.168.212.0/24"), comma
-# separated.
-#
-# NOTE: both shell tasks below use the keyed `cmd:` form rather than the
-# bare `shell: |` string form. Ansible's free-form shell/command parser
-# tries to detect trailing key=value args by walking the string and
-# toggling quote state on every quote character it sees, without being
-# aware of bash quote nesting (a single quote inside a double-quoted
-# string is literal in bash, but this parser does not know that). Scripts
-# with nested quoting -- like the netplan grep below -- can trip a false
-# "unbalanced jinja2 block or quotes" error even though the bash itself
-# is valid. The dict/cmd: form skips that parser entirely.
 
 - name: Check that jq is available on the control node
   ansible.builtin.command: jq --version
@@ -69,19 +38,23 @@
       ALL_RESULTS=()
 
       IFS=',' read -ra SUBNETS <<< "{{ subnets }}"
+      IFS=',' read -ra EXCLUDE_IPS <<< "{{ exclude_ips | default([]) | join(',') }}"
+
+      is_excluded() {
+        local ip="$1"
+        for ex in "${EXCLUDE_IPS[@]}"; do
+          [ -z "$ex" ] && continue
+          [ "$ip" = "$ex" ] && return 0
+        done
+        return 1
+      }
 
       for subnet in "${SUBNETS[@]}"; do
         subnet="$(echo "$subnet" | xargs)"
         [ -z "$subnet" ] && continue
-        # Bare base like "192.168.212.0" -> assume /24
         [[ "$subnet" != */* ]] && subnet="${subnet}/24"
 
         if command -v nmap >/dev/null 2>&1; then
-          # -T4 + explicit --host-timeout/--max-retries are required here:
-          # without them, nmap adaptive timing can spend a long time per
-          # address on a /24 where most IPs are unused/filtered (no RST
-          # comes back). timeout is a hard backstop in case even that
-          # is not enough on a weird network.
           mapfile -t OPEN_IPS < <(timeout 60 nmap -n -Pn -T4 --host-timeout 5s --max-retries 1 -p "$PORT" --open "$subnet" -oG - | awk '/Ports/{print $2}')
         else
           BASE="${subnet%.*/*}"
@@ -95,18 +68,18 @@
           )
         fi
 
-        # SSH-probe discovered hosts IN PARALLEL. Doing this one host at a
-        # time (each with its own multi-second connect timeout) is the
-        # other big source of apparent "hangs" once a subnet has more than
-        # a handful of live hosts.
+        FILTERED_IPS=()
+        for ip in "${OPEN_IPS[@]}"; do
+          is_excluded "$ip" || FILTERED_IPS+=("$ip")
+        done
+        OPEN_IPS=("${FILTERED_IPS[@]}")
+
         mapfile -t RESULT_LINES < <(
           for ip in "${OPEN_IPS[@]}"; do
             (
               hostname=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "hostname" 2>/dev/null) || exit 0
               [ -z "$hostname" ] && exit 0
 
-              # Naming-agnostic grouping: strip trailing -<digits> tokens,
-              # repeatedly, to handle double numeric suffixes too.
               group="$hostname"
               while echo "$group" | grep -qE -- '-[0-9]+$'; do
                 group=$(echo "$group" | sed -E 's/-[0-9]+$//')
@@ -120,20 +93,6 @@
         )
         ALL_RESULTS+=("${RESULT_LINES[@]}")
       done
-
-      # --- Resolve one static ip per hostname -----------------------------
-      # A single machine can answer on more than one scanned ip (a real
-      # static ip plus a floating/secondary one added later). We pick ONE
-      # to use as ansible_host, in this order:
-      #   1. netplan: an ip explicitly listed under an interface
-      #      "addresses:" block on the machine itself -- this is the
-      #      strongest signal, since floating ips added with `ip addr add`
-      #      generally never get written into netplan config.
-      #   2. route: the source ip of the default route on that machine, as
-      #      a netplan-agnostic fallback that works on most distros.
-      #   3. guess: lowest ip numerically, flagged as an unverified
-      #      fallback rather than a confirmed identity.
-      # Any ip not chosen is kept as an "extra_ips" note, not discarded.
 
       resolve_primary_ip() {
         local hostname="$1"; shift
@@ -314,3 +273,5 @@
       Discovered {{ discovered_hosts_list | length }} host(s) across
       {{ subnets }}. hosts.yaml written for the record; documentation
       subtasks in this same run will target the "discovered_fleet" group.
+      {% if exclude_ips | default([]) | length > 0 %}Excluded ips this run:
+      {{ exclude_ips | join(', ') }}.{% endif %}

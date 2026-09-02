@@ -12,7 +12,7 @@ Auto-Doc is an Ansible playbook that discovers your servers and documents them a
 - **Read-only** — never modifies target machines. Only reads (`cat`, `grep`, `df`, `lsblk`, etc.).
 - **One file per topic** — each component (`os`, `cpu`, `docker`, ...) is its own task and its own output file, so you can add or update one without touching the rest.
 - **Consistent, sorted output** — every JSON file uses the same `<component>_<field>` naming, and hosts are listed in IP order.
-- **Grafana-ready** — the `outputs/` folder is plain JSON, built to be queried directly with Grafana's Infinity datasource.
+- **Grafana-ready** — the `outputs/` folder is plain JSON, served over HTTP by the bundled `docker-compose.yml` and built to be queried directly with Grafana's Infinity datasource.
 
 ## Project structure
 
@@ -21,6 +21,8 @@ Auto-Doc is an Ansible playbook that discovers your servers and documents them a
 ├── main.yaml            # runs discovery, then all the collectors
 ├── ansible.cfg           # points the default inventory at hosts.yaml
 ├── hosts.yaml            # output record only, not read as input
+├── docker-compose.yml    # serves outputs/ over HTTP for Grafana
+├── dashboard.json         # ready-made Grafana dashboard (import as-is)
 ├── tasks/
 │   ├── discover.yaml     # finds machines, resolves their static IP
 │   ├── os.yaml
@@ -49,6 +51,14 @@ That's it — no `-i` flag needed. Subnets are set in the `subnets` var at the t
 What happens:
 1. `discover` scans those subnets, SSHes into whatever it finds, and figures out each machine's hostname, group, and real static IP.
 2. Those machines are used immediately by the rest of the same run — `os`, `cpu`, `memory`, `storage`, `network`, `tools`, `docker`, `ip-inventory` — each writing its own file to `outputs/`.
+
+## Viewing it in Grafana
+
+```bash
+docker compose up -d
+```
+
+This serves `outputs/` over HTTP on port `8080`, which is what Grafana's Infinity datasource queries. Import `dashboard.json` into Grafana to get a ready-made view — no panels to build from scratch.
 
 ## Prerequisites
 

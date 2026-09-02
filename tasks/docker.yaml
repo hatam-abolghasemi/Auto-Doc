@@ -43,10 +43,11 @@
   copy:
     dest: outputs/docker.json
     content: >-
-      {{ ansible_play_hosts_all 
-         | map('extract', hostvars, 'host_images_list') 
-         | flatten 
-         | select('defined')
-         | list
-         | to_nice_json(indent=4) }}
+      {{
+        ansible_play_hosts_all
+        | map('extract', hostvars)
+        | map(attribute='host_images_list', default=[])
+        | flatten
+        | to_nice_json(indent=4)
+      }}
     force: yes
