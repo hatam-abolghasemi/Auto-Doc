@@ -2,6 +2,8 @@
 
 Auto-Doc is an Ansible playbook that discovers your servers and documents them automatically. It scans a subnet, finds every reachable machine, and writes out flat JSON files describing each one's OS, CPU, memory, storage, network, installed tools, Docker containers, and IPs.
 
+📖 **Read the full writeup:** [DaaC: The Lost XaaC Nobody Talks About](https://medium.com/@hatamabolghasemi/daac-the-lost-xaac-nobody-talks-about-5b590838115e) — why "Documentation as Code" is the XaaC nobody named, the six design fights that shaped this playbook (netplan IP resolution, LVM/Ceph/NFS-aware storage, per-tool version parsing, and more), and how Auto-Doc compares to NetBox, phpIPAM, ansible-cmdb, and Wazuh. Also on [dev.to](https://dev.to/hatamabolghasemi/daac-the-lost-xaac-nobody-talks-about-1b77).
+
 ![Tool inventory view in Grafana](docs/screenshots/tool-inventory.png)
 
 *Every host, every tool, every version — one table. (Screenshot is running against the sample data in `examples/outputs/`, not a real fleet.)*
