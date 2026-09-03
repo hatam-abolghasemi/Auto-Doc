@@ -1,6 +1,6 @@
 services:
   autodoc:
-    image: hatam-abolghasemi/json-exposer:1.0.0
+    build: ./json-exposer
     container_name: autodoc
     restart: unless-stopped
     ports:

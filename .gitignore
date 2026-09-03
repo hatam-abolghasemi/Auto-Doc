@@ -1,0 +1,4 @@
+# Real playbook output — never commit actual fleet data.
+# Demo/sample data for trying the dashboard lives in examples/outputs/ instead.
+/outputs/
+.discovery_raw.txt
