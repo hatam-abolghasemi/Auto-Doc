@@ -22,8 +22,17 @@
   run_once: yes
   ansible.builtin.shell: |
     jq '
+      # trim trailing digits and trailing dashes repeatedly until it ends in a letter
+      def trim_group:
+        def loop:
+          if test("[0-9]+$") then (sub("[0-9]+$"; "") | loop)
+          elif test("-+$") then (sub("-+$"; "") | loop)
+          else .
+          end;
+        loop;
+
       # lookup: subnet -> { network_ip -> {name: target_name, group: target_group} }
-      (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: $e.target_group})) as $lookup
+      (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: ($e.target_group | trim_group)})) as $lookup
 
       # per-subnet metadata: subnet string, key segment (3rd octet), base (first 3 octets)
       | ($lookup | keys | sort) as $subnets
