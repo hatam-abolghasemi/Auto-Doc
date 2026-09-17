@@ -23,19 +23,109 @@
     cmd: |
       set -uo pipefail
       PORT="{{ discovery_ssh_port | default(22) }}"
-      SSH_USER="{{ discovery_ssh_user | default('root') }}"
-      SSH_KEY="{{ discovery_ssh_key | default('~/.ssh/id_rsa') }}"
-      SSH_OPTS=(
-        -o BatchMode=yes
-        -o ConnectTimeout=3
-        -o StrictHostKeyChecking=accept-new
-        -o UserKnownHostsFile=/dev/null
-        -o LogLevel=ERROR
-        -p "$PORT"
-        -i "$SSH_KEY"
+
+      # How long a single ssh attempt (one user+key combo, one host) is allowed
+      # to run before it's killed outright. ConnectTimeout only bounds the TCP
+      # handshake -- a stuck auth negotiation (gssapi, a passphrase-protected
+      # key, an oddly behaving server) can still hang past that, so every ssh
+      # call below is wrapped in `timeout` as a hard backstop. Nothing is left
+      # running longer than this, ever.
+      SSH_TRY_TIMEOUT="{{ discovery_ssh_timeout | default(6) }}"
+
+      # Users to try per host, in order, until one authenticates.
+      IFS=',' read -ra SSH_USERS <<< "{{ discovery_ssh_users | default([discovery_ssh_user | default('root')]) | join(',') }}"
+
+      # Keys the caller explicitly configured (if any) get tried first, before
+      # anything auto-discovered. Empty by default -- most fleets shouldn't
+      # need to set this at all.
+      CONFIGURED_KEYS_CSV="{{ (discovery_ssh_keys | default([]) + ([discovery_ssh_key] if discovery_ssh_key is defined else [])) | join(',') }}"
+
+      ssh_opts_for_key() {
+        local key="$1"
+        SSH_OPTS_CUR=(
+          -o BatchMode=yes
+          -o ConnectTimeout=3
+          -o ConnectionAttempts=1
+          -o ServerAliveInterval=3
+          -o ServerAliveCountMax=1
+          -o PreferredAuthentications=publickey
+          -o GSSAPIAuthentication=no
+          -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR
+          -p "$PORT"
+        )
+        if [ "$key" != "__default__" ]; then
+          SSH_OPTS_CUR+=(-i "$key")
+        fi
+      }
+
+      # Builds the ordered list of keys to try against a specific target:
+      # 1) any keys explicitly configured above
+      # 2) every IdentityFile ssh would already use for this target according
+      #    to this control node's own ssh config (`ssh -G` is a pure local
+      #    config lookup -- no network call, can't hang, doesn't touch
+      #    anything), filtered down to files that actually exist on disk
+      # 3) "__default__" as a final catch-all, meaning "don't pass -i at all"
+      #    and let ssh fall back to ssh-agent / normal resolution itself --
+      #    this is what covers agent-forwarded or hardware-token keys that
+      #    aren't backed by a file at all
+      # Duplicate keys are only tried once, first occurrence wins.
+      get_keys_for_target() {
+        local target="$1"
+        local -a keys=()
+        local -a configured=()
+        if [ -n "$CONFIGURED_KEYS_CSV" ]; then
+          IFS=',' read -ra configured <<< "$CONFIGURED_KEYS_CSV"
+        fi
+        local k f dup existing
+        for k in "${configured[@]}"; do
+          k="$(echo "$k" | xargs)"
+          [ -n "$k" ] && keys+=("$k")
+        done
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          dup=0
+          for existing in "${keys[@]}"; do
+            [ "$existing" = "$f" ] && dup=1 && break
+          done
+          [ "$dup" -eq 0 ] && keys+=("$f")
+        done < <(timeout "$SSH_TRY_TIMEOUT" ssh -G "$target" 2>/dev/null \
+                    | awk 'tolower($1)=="identityfile"{print $2}' \
+                    | sed "s|^~|$HOME|" \
+                    | while IFS= read -r ff; do [ -f "$ff" ] && echo "$ff"; done)
+        keys+=("__default__")
+        printf '%s\n' "${keys[@]}"
+      }
+
+      # Domain suffixes to strip when deriving a host's group name. Sorted
+      # longest-first: a more specific suffix like "dc1.company.local"
+      # must be tried before the shorter "company.local" it ends with --
+      # otherwise the shorter one matches first, strips only part of the
+      # domain, and the longer one never gets a chance to match what's left
+      # (e.g. "infra-awx-186.dc1.company.local" would stop at
+      # "infra-awx-186.dc1" instead of reducing all the way to
+      # "infra-awx-186").
+      mapfile -t DOMAIN_SUFFIXES < <(
+        IFS=',' read -ra _raw_suffixes <<< "{{ discovery_domain_suffix | default(['dc1.local', 'company.dev', 'company.local', 'company.internal', 'dc1.company.local']) | join(',') }}"
+        for _s in "${_raw_suffixes[@]}"; do
+          _s="$(echo "$_s" | xargs)"
+          [ -n "$_s" ] && printf '%s\n' "$_s"
+        done | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
       )
+
       CONCURRENCY=50
       ALL_RESULTS=()
+      PROGRESS_LOG="{{ playbook_dir }}/outputs/.discovery_progress.log"
+      : > "$PROGRESS_LOG"
+      log_progress() {
+        echo "[$(date '+%H:%M:%S')] $*" >> "$PROGRESS_LOG"
+      }
+      # Counts array elements via a positional-parameter trick instead of
+      # bash's usual array-length syntax, because that syntax's dollar-brace-
+      # hash opening sequence is misread by Ansible's Jinja templating as a
+      # comment-open tag and can silently corrupt or break this script.
+      arrlen() { echo "$#"; }
 
       IFS=',' read -ra SUBNETS <<< "{{ subnets }}"
       IFS=',' read -ra EXCLUDE_IPS <<< "{{ exclude_ips | default([]) | join(',') }}"
@@ -49,56 +139,127 @@
         return 1
       }
 
+      # --- Phase 1: port-scan every subnet at once, not one at a time. ------
+      # This used to be a sequential `for subnet in ...` loop where each
+      # nmap call could take up to 60s -- with N subnets that's up to N*60s
+      # before the last one even starts. Now every subnet is scanned in its
+      # own background job concurrently, so total phase-1 time is bounded by
+      # the single slowest subnet, not the sum of all of them.
+      log_progress "phase 1: scanning $(arrlen "${SUBNETS[@]}") subnet(s) for open port ${PORT} (in parallel)"
+
+      SCAN_TMPDIR=$(mktemp -d)
+      trap 'rm -rf "$SCAN_TMPDIR"' EXIT
+
+      subnet_idx=0
+      SCAN_PIDS=()
       for subnet in "${SUBNETS[@]}"; do
         subnet="$(echo "$subnet" | xargs)"
         [ -z "$subnet" ] && continue
         [[ "$subnet" != */* ]] && subnet="${subnet}/24"
+        subnet_idx=$((subnet_idx + 1))
+        outfile="$SCAN_TMPDIR/subnet_${subnet_idx}.txt"
 
-        if command -v nmap >/dev/null 2>&1; then
-          mapfile -t OPEN_IPS < <(timeout 60 nmap -n -Pn -T4 --host-timeout 5s --max-retries 1 -p "$PORT" --open "$subnet" -oG - | awk '/Ports/{print $2}')
-        else
-          BASE="${subnet%.*/*}"
-          mapfile -t OPEN_IPS < <(
+        (
+          if command -v nmap >/dev/null 2>&1; then
+            timeout 60 nmap -n -Pn -T4 --host-timeout 5s --max-retries 1 -p "$PORT" --open "$subnet" -oG - 2>/dev/null \
+              | awk '/Ports/{print $2}' > "$outfile"
+          else
+            BASE="${subnet%.*/*}"
+            : > "$outfile"
             for i in $(seq 1 254); do
               ip="${BASE}.${i}"
-              (timeout 0.5 bash -c "exec 3<>/dev/tcp/${ip}/${PORT}" 2>/dev/null && echo "$ip") &
+              (timeout 0.5 bash -c "exec 3<>/dev/tcp/${ip}/${PORT}" 2>/dev/null && echo "$ip" >> "$outfile") &
               while (( $(jobs -r | wc -l) >= CONCURRENCY )); do wait -n; done
             done
             wait
-          )
-        fi
-
-        FILTERED_IPS=()
-        for ip in "${OPEN_IPS[@]}"; do
-          is_excluded "$ip" || FILTERED_IPS+=("$ip")
-        done
-        OPEN_IPS=("${FILTERED_IPS[@]}")
-
-        mapfile -t RESULT_LINES < <(
-          for ip in "${OPEN_IPS[@]}"; do
-            (
-              hostname=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "hostname" 2>/dev/null) || exit 0
-              [ -z "$hostname" ] && exit 0
-
-              group="$hostname"
-              while echo "$group" | grep -qE -- '-[0-9]+$'; do
-                group=$(echo "$group" | sed -E 's/-[0-9]+$//')
-              done
-
-              printf '%s|%s|%s\n' "$ip" "$hostname" "$group"
-            ) &
-            while (( $(jobs -r | wc -l) >= CONCURRENCY )); do wait -n; done
-          done
-          wait
-        )
-        ALL_RESULTS+=("${RESULT_LINES[@]}")
+          fi
+          log_progress "phase 1: ${subnet} done -- $(wc -l < "$outfile") host(s) with port ${PORT} open"
+        ) &
+        SCAN_PIDS+=("$!")
       done
+      wait "${SCAN_PIDS[@]}"
+
+      ALL_OPEN_IPS=()
+      for outfile in "$SCAN_TMPDIR"/subnet_*.txt; do
+        [ -f "$outfile" ] || continue
+        while IFS= read -r ip; do
+          [ -z "$ip" ] && continue
+          is_excluded "$ip" && continue
+          ALL_OPEN_IPS+=("$ip")
+        done < "$outfile"
+      done
+      log_progress "phase 1 complete: $(arrlen "${ALL_OPEN_IPS[@]}") total host(s) to probe over ssh"
+
+      # --- Phase 2: ssh-probe every discovered host in one shared pool. -----
+      # All subnets feed into a single CONCURRENCY-limited pool here instead
+      # of each subnet getting its own separate batch, so probing for subnet
+      # #2 isn't blocked waiting on subnet #1 to fully finish.
+      probed=0
+      total_to_probe=$(arrlen "${ALL_OPEN_IPS[@]}")
+
+      mapfile -t ALL_RESULTS < <(
+        for ip in "${ALL_OPEN_IPS[@]}"; do
+          (
+            hostname=""
+            auth_user=""
+            auth_key=""
+            mapfile -t KEYS_FOR_IP < <(get_keys_for_target "$ip")
+            for user in "${SSH_USERS[@]}"; do
+              for key in "${KEYS_FOR_IP[@]}"; do
+                ssh_opts_for_key "$key"
+                hostname=$(timeout "$SSH_TRY_TIMEOUT" ssh "${SSH_OPTS_CUR[@]}" "${user}@${ip}" "hostname" 2>/dev/null)
+                if [ -n "$hostname" ]; then
+                  auth_user="$user"
+                  auth_key="$key"
+                  break 2
+                fi
+              done
+            done
+            [ -z "$hostname" ] && exit 0
+
+            group="$hostname"
+            stripped=1
+            while [ "$stripped" -eq 1 ]; do
+              stripped=0
+              for suf in "${DOMAIN_SUFFIXES[@]}"; do
+                if [[ "$group" == *".${suf}" ]]; then
+                  group="${group%.${suf}}"
+                  stripped=1
+                  break
+                fi
+              done
+            done
+            # strip any trailing run of non-letter characters (digits, dashes,
+            # dots, etc.) one char at a time until the group ends in a letter
+            # (e.g. "worker8" -> "worker", "node-104037" -> "node",
+            # "app.stg-" -> "app.stg" -> "app")
+            while [[ "$group" =~ [^A-Za-z]$ ]]; do
+              group="${group%?}"
+            done
+
+            printf '%s|%s|%s|%s|%s\n' "$ip" "$hostname" "$group" "$auth_user" "$auth_key"
+          ) &
+          while (( $(jobs -r | wc -l) >= CONCURRENCY )); do
+            wait -n
+            probed=$((probed + 1))
+            (( probed % 25 == 0 )) && log_progress "phase 2: probed ~${probed}/${total_to_probe} host(s)"
+          done
+        done
+        wait
+      )
+      log_progress "phase 2 complete: $(arrlen "${ALL_RESULTS[@]}") host(s) authenticated and responded"
 
       resolve_primary_ip() {
         local hostname="$1"; shift
+        local ssh_user="$1"; shift
+        local ssh_key="$1"; shift
         local candidates=("$@")
 
-        if [ "$#" -eq 1 ]; then
+        ssh_opts_for_key "$ssh_key"
+
+        local candidate_count
+        candidate_count=$(printf '%s\n' "${candidates[@]}" | grep -c .)
+        if [ "$candidate_count" -eq 1 ]; then
           echo "${candidates[0]}|single"
           return
         fi
@@ -106,7 +267,7 @@
         local probe_ip="${candidates[0]}"
 
         local netplan_ips
-        netplan_ips=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${probe_ip}" \
+        netplan_ips=$(timeout "$SSH_TRY_TIMEOUT" ssh "${SSH_OPTS_CUR[@]}" "${ssh_user}@${probe_ip}" \
           "grep -hoE '^[[:space:]]*-[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' /etc/netplan/*.yaml 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'" 2>/dev/null)
 
         local match="" count=0
@@ -121,7 +282,7 @@
         fi
 
         local route_ip
-        route_ip=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${probe_ip}" \
+        route_ip=$(timeout "$SSH_TRY_TIMEOUT" ssh "${SSH_OPTS_CUR[@]}" "${ssh_user}@${probe_ip}" \
           "ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'" 2>/dev/null)
         for ip in "${candidates[@]}"; do
           if [ "$ip" = "$route_ip" ]; then
@@ -137,13 +298,17 @@
 
       declare -A HOST_IPS
       declare -A HOST_GROUP
+      declare -A HOST_AUTH_USER
+      declare -A HOST_AUTH_KEY
       declare -a HOST_ORDER
 
-      while IFS='|' read -r ip hostname group; do
+      while IFS='|' read -r ip hostname group auth_user auth_key; do
         [ -z "$hostname" ] && continue
         if [ -z "${HOST_GROUP[$hostname]+x}" ]; then
           HOST_ORDER+=("$hostname")
           HOST_GROUP[$hostname]="$group"
+          HOST_AUTH_USER[$hostname]="$auth_user"
+          HOST_AUTH_KEY[$hostname]="$auth_key"
         fi
         HOST_IPS[$hostname]="${HOST_IPS[$hostname]:-} $ip"
       done < <(printf '%s\n' "${ALL_RESULTS[@]}" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
@@ -151,7 +316,7 @@
       FINAL_RESULTS=()
       for hostname in "${HOST_ORDER[@]}"; do
         read -ra candidates <<< "${HOST_IPS[$hostname]}"
-        resolved=$(resolve_primary_ip "$hostname" "${candidates[@]}")
+        resolved=$(resolve_primary_ip "$hostname" "${HOST_AUTH_USER[$hostname]}" "${HOST_AUTH_KEY[$hostname]}" "${candidates[@]}")
         chosen_ip="${resolved%%|*}"
         method="${resolved##*|}"
 
@@ -162,7 +327,7 @@
         extra_csv=$(IFS=,; echo "${extra[*]}")
         [ -z "$extra_csv" ] && extra_csv="-"
 
-        FINAL_RESULTS+=("${chosen_ip}|${hostname}|${HOST_GROUP[$hostname]}|${extra_csv}|${method}")
+        FINAL_RESULTS+=("${chosen_ip}|${hostname}|${HOST_GROUP[$hostname]}|${extra_csv}|${method}|${HOST_AUTH_USER[$hostname]}|${HOST_AUTH_KEY[$hostname]}")
       done
 
       printf '%s\n' "${FINAL_RESULTS[@]}" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
@@ -183,8 +348,23 @@
   loop: "{{ discovery_raw.stdout_lines }}"
   when:
     - item | trim != ""
-    - (item.split('|') | length) == 5
+    - (item.split('|') | length) == 7
     - item.split('|')[4] == "guess"
+  loop_control:
+    label: "{{ item.split('|')[1] }}"
+
+- name: Warn about hosts reached only via a non-default ssh credential
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.split('|')[1] }} did not authenticate with the default
+      discovery credential; it responded as user "{{ item.split('|')[5] }}"
+      using key "{{ item.split('|')[6] }}". Subsequent tasks against this
+      host will use that same credential automatically.
+  loop: "{{ discovery_raw.stdout_lines }}"
+  when:
+    - item | trim != ""
+    - (item.split('|') | length) == 7
+    - not (item.split('|')[5] == (discovery_ssh_user | default('root')) and item.split('|')[6] == (discovery_ssh_key | default('~/.ssh/id_rsa')))
   loop_control:
     label: "{{ item.split('|')[1] }}"
 
@@ -203,7 +383,9 @@
         | map({
             ip: .[0], hostname: .[1], group: .[2],
             extra_ips: (if .[3] == "-" then [] else (.[3] | split(",")) end),
-            ip_source: .[4]
+            ip_source: .[4],
+            auth_user: .[5],
+            auth_key: .[6]
           })
         | group_by(.group)
         | map({
@@ -211,13 +393,14 @@
             value: {
               hosts: (map({
                 key: .hostname,
-                value: {
+                value: ({
                   ansible_host: .ip,
                   target_name: .hostname,
                   target_group: .group,
                   extra_ips: .extra_ips,
-                  ip_source: .ip_source
-                }
+                  ip_source: .ip_source,
+                  ansible_user: .auth_user
+                } + (if .auth_key == "__default__" then {} else {ansible_ssh_private_key_file: .auth_key} end))
               }) | from_entries)
             }
           })
@@ -242,12 +425,14 @@
         'hostname': item.split('|')[1],
         'group': item.split('|')[2],
         'extra_ips': (item.split('|')[3] if item.split('|')[3] != '-' else ''),
-        'ip_source': item.split('|')[4]
+        'ip_source': item.split('|')[4],
+        'auth_user': item.split('|')[5],
+        'auth_key': item.split('|')[6]
       }] }}
   loop: "{{ discovery_raw.stdout_lines }}"
   when:
     - item | trim != ""
-    - (item.split('|') | length) == 5
+    - (item.split('|') | length) == 7
 
 - name: "Inject discovered hosts into THIS run's live inventory"
   ansible.builtin.add_host:
@@ -260,8 +445,8 @@
     target_group: "{{ item.group }}"
     extra_ips: "{{ item.extra_ips }}"
     ip_source: "{{ item.ip_source }}"
-    ansible_user: "{{ discovery_ssh_user | default('root') }}"
-    ansible_ssh_private_key_file: "{{ discovery_ssh_key | default('~/.ssh/id_rsa') }}"
+    ansible_user: "{{ item.auth_user }}"
+    ansible_ssh_private_key_file: "{{ omit if item.auth_key == '__default__' else item.auth_key }}"
     ansible_port: "{{ discovery_ssh_port | default(22) }}"
   loop: "{{ discovered_hosts_list }}"
   loop_control:

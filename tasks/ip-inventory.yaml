@@ -22,14 +22,15 @@
   run_once: yes
   ansible.builtin.shell: |
     jq '
-      # trim trailing digits and trailing dashes repeatedly until it ends in a letter
       def trim_group:
+        def strip_domain:
+          if test("\\.domain\\.dev$") then (sub("\\.domain\\.dev$"; "") | strip_domain) else . end;
         def loop:
           if test("[0-9]+$") then (sub("[0-9]+$"; "") | loop)
           elif test("-+$") then (sub("-+$"; "") | loop)
           else .
           end;
-        loop;
+        strip_domain | loop;
 
       # lookup: subnet -> { network_ip -> {name: target_name, group: target_group} }
       (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: ($e.target_group | trim_group)})) as $lookup
