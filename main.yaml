@@ -37,3 +37,16 @@
             - docker
             - ip-inventory
       ignore_errors: true
+
+- name: Publish documentation as a spreadsheet
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tags: [sheets]
+  vars:
+    autodoc_python: "{{ ansible_playbook_python }}"
+    autodoc_xlsx: "{{ playbook_dir }}/outputs/auto-doc.xlsx"
+    sheets_secrets_file: "{{ playbook_dir }}/secrets/sheets.yaml"
+  tasks:
+    - name: Build xlsx and update the Google Sheet
+      include_tasks: "./tasks/sheets.yaml"

@@ -1,0 +1,110 @@
+---
+# Control-node only: outputs/*.json -> outputs/auto-doc.xlsx -> Google Sheet.
+#
+# Google settings come from secrets/sheets.yaml (gitignored), see
+# secrets/sheets.example.yaml and docs/google-sheets.md. Environment
+# variables AUTODOC_SHEET_ID / GOOGLE_APPLICATION_CREDENTIALS are the
+# fallback for CI. With neither, the xlsx is still built and the upload
+# is skipped (not failed).
+
+- name: Check that openpyxl is available on the control node
+  ansible.builtin.command:
+    argv: ["{{ autodoc_python }}", "-c", "import openpyxl"]
+  register: openpyxl_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if openpyxl is missing on the control node
+  ansible.builtin.fail:
+    msg: "openpyxl is required to build {{ autodoc_xlsx | basename }} (pip install -r scripts/requirements.txt)"
+  when: openpyxl_check.rc != 0
+
+- name: Build styled workbook from outputs/*.json (Local)
+  ansible.builtin.command:
+    argv:
+      - "{{ autodoc_python }}"
+      - "{{ playbook_dir }}/scripts/json-to-xlsx.py"
+      - --input
+      - "{{ playbook_dir }}/outputs"
+      - --output
+      - "{{ autodoc_xlsx }}"
+  register: xlsx_build
+  changed_when: false
+
+- name: Show workbook summary
+  ansible.builtin.debug:
+    msg: "{{ xlsx_build.stdout }}"
+
+- name: Look for the Google Sheets secrets file
+  ansible.builtin.stat:
+    path: "{{ sheets_secrets_file }}"
+  register: sheets_secrets
+
+- name: Load Google Sheets settings from the secrets file
+  ansible.builtin.include_vars:
+    file: "{{ sheets_secrets_file }}"
+  when: sheets_secrets.stat.exists
+
+- name: Resolve Google Sheets settings (secrets file first, then environment)
+  ansible.builtin.set_fact:
+    sheets_id: "{{ autodoc_sheet_id | default(lookup('env', 'AUTODOC_SHEET_ID'), true) }}"
+    sheets_key: >-
+      {%- set key = autodoc_google_credentials | default(lookup('env', 'GOOGLE_APPLICATION_CREDENTIALS'), true) -%}
+      {{ key if (not key or key.startswith('/')) else playbook_dir ~ '/' ~ key }}
+    sheets_proxy: "{{ autodoc_https_proxy | default(lookup('env', 'HTTPS_PROXY'), true) }}"
+
+- name: Decide whether to publish to Google Sheets
+  ansible.builtin.set_fact:
+    sheets_publish: "{{ (sheets_id | length > 0) and (sheets_key | length > 0) }}"
+
+- name: Skip notice (no Google Sheets settings)
+  ansible.builtin.debug:
+    msg: "Google Sheets upload skipped: no {{ sheets_secrets_file | relpath(playbook_dir) }} (see docs/google-sheets.md)"
+  when: not sheets_publish
+
+- name: Publish workbook to Google Sheets
+  when: sheets_publish
+  block:
+    - name: Check that the Google API client is available on the control node
+      ansible.builtin.command:
+        argv: ["{{ autodoc_python }}", "-c", "import googleapiclient, google.oauth2"]
+      register: google_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the Google API client is missing on the control node
+      ansible.builtin.fail:
+        msg: "google-api-python-client and google-auth are required to publish (pip install -r scripts/requirements.txt)"
+      when: google_check.rc != 0
+
+    - name: Check that the service account key exists
+      ansible.builtin.stat:
+        path: "{{ sheets_key }}"
+      register: sa_key
+
+    - name: Fail if the service account key is missing
+      ansible.builtin.fail:
+        msg: "Service account key not found at {{ sheets_key }} (see docs/google-sheets.md)"
+      when: not sa_key.stat.exists
+
+    - name: Overwrite the Google Sheet with the workbook (Local)
+      ansible.builtin.command:
+        argv:
+          - "{{ autodoc_python }}"
+          - "{{ playbook_dir }}/scripts/xlsx-to-sheets.py"
+          - --file
+          - "{{ autodoc_xlsx }}"
+          - --sheet-id
+          - "{{ sheets_id }}"
+          - --credentials
+          - "{{ sheets_key }}"
+      # Both cases: httplib2 reads lowercase first. Empty means direct.
+      environment:
+        HTTPS_PROXY: "{{ sheets_proxy }}"
+        https_proxy: "{{ sheets_proxy }}"
+      register: sheets_upload
+      changed_when: true
+
+    - name: Show Google Sheet link
+      ansible.builtin.debug:
+        msg: "{{ sheets_upload.stdout }}"

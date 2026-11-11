@@ -18,6 +18,7 @@ Auto-Doc is an Ansible playbook that discovers your servers and documents them a
 - **Read-only** — never modifies target machines. Only reads (`cat`, `grep`, `df`, `lsblk`, etc.).
 - **One file per topic** — each component (`os`, `cpu`, `docker`, ...) is its own task and its own output file, so you can add or update one without touching the rest.
 - **Consistent, sorted output** — every JSON file uses the same `<component>_<field>` naming, and hosts are listed in IP order.
+- **Google Sheets export** — the same data as one linked, color-coded spreadsheet (machines, storage, network, IP map, subnets, services, containers), republished to the same Google Sheet every run. Readable by anyone, no Grafana needed.
 - **Grafana-ready** — the `outputs/` folder is plain JSON, served over HTTP by the bundled `docker-compose.yml` and built to be queried directly with Grafana's Infinity datasource.
 
 ## Try it in 60 seconds (no servers needed)
@@ -40,6 +41,11 @@ Then import `dashboard.json` into Grafana. You'll get the fully populated view a
 ├── hosts.yaml               # output record only, not read as input
 ├── docker-compose.yml       # serves outputs/ over HTTP for Grafana
 ├── dashboard.json            # ready-made Grafana dashboard (import as-is)
+├── scripts/                  # control-node Python for the spreadsheet export
+│   ├── json-to-xlsx.py       # outputs/*.json -> styled, linked auto-doc.xlsx
+│   ├── xlsx-to-sheets.py     # publishes it to a Google Sheet
+│   └── requirements.txt
+├── secrets/                  # gitignored except sheets.example.yaml
 ├── tasks/
 │   ├── discover.yaml        # finds machines, resolves their static IP
 │   ├── os.yaml
@@ -49,10 +55,12 @@ Then import `dashboard.json` into Grafana. You'll get the fully populated view a
 │   ├── network.yaml
 │   ├── tools.yaml
 │   ├── docker.yaml
-│   └── ip-inventory.yaml
+│   ├── ip-inventory.yaml
+│   └── sheets.yaml           # builds the xlsx, publishes it to Google Sheets
 ├── examples/
 │   └── outputs/              # fake sample data — see "Try it in 60 seconds"
 ├── docs/
+│   ├── google-sheets.md      # one-time service account + Sheet setup
 │   └── screenshots/
 ├── json-exposer/             # tiny Go static-file server, built locally by docker-compose
 │   ├── main.go
@@ -74,6 +82,7 @@ That's it — no `-i` flag needed. Subnets are set in the `subnets` var at the t
 What happens:
 1. `discover` scans those subnets, SSHes into whatever it finds, and figures out each machine's hostname, group, and real static IP.
 2. Those machines are used immediately by the rest of the same run — `os`, `cpu`, `memory`, `storage`, `network`, `tools`, `docker`, `ip-inventory` — each writing its own file to `outputs/`.
+3. `sheets` turns `outputs/` into `outputs/auto-doc.xlsx` and, if configured, publishes it to Google Sheets.
 
 `outputs/` is gitignored on purpose — it's your real fleet's data (hostnames, IPs, installed tool versions). Don't commit it.
 
@@ -87,10 +96,40 @@ This builds `json-exposer` — a ~60-line, dependency-free Go server vendored in
 
 ![IP inventory view in Grafana](docs/screenshots/ip-inventory.png)
 
+## Viewing it in Google Sheets
+
+The last play builds `outputs/auto-doc.xlsx` and publishes it to one Google Sheet (same URL every run). A machine is identified by `target_name` + `target_ip` + `target_group` throughout; one-to-one facts are merged into **Machines**, one-to-many facts get their own tab linked back to it.
+
+| Tab | One row per | Answers |
+|---|---|---|
+| Overview | – | Totals, and what each tab is for |
+| Groups | group | Size, OS mix, total cores/RAM/disk, subnets, top services |
+| Machines | machine | OS, CPU, memory, platform, plus disk/NIC/service/container counts that jump to the details |
+| Storage | disk/volume | Mountpoint, device, size (GiB), type, model, read-only |
+| Network | interface | IP, subnet, gateway, MAC, MTU, state, default route |
+| IP Map | last octet | Who holds which IP; one column per /24, gateways marked, blank = free, conflicts in red |
+| Subnets | /24 | Used, free, utilization, gateways, groups |
+| Services | machine | What is installed where; cell = version, green running, red stopped, amber not enabled at boot |
+| Service Details | service | Ports, install method, path |
+| Containers | container | Image, ports, networks, mounts |
+
+Names, groups, counts and subnets are links to the related rows. Settings come from `secrets/sheets.yaml` (gitignored); first-time setup, including the service account key, is in [docs/google-sheets.md](docs/google-sheets.md). Without settings the xlsx is still built and the upload is skipped.
+
+Try it on the sample data, no servers or Google account needed (the upload is skipped):
+
+```bash
+pip install -r scripts/requirements.txt
+mkdir -p outputs && cp examples/outputs/*.json outputs/
+ansible-playbook main.yaml --tags sheets
+```
+
+Each [release](https://github.com/hatam-abolghasemi/auto-doc/releases) also ships the workbook built from `examples/outputs/`.
+
 ## Prerequisites
 
 - **SSH key-based root access** to every target machine.
 - **`ansible` and `jq`** installed on the control node.
+- **`pip install -r scripts/requirements.txt`** on the control node, for the spreadsheet export only.
 
 ## Adding a new field
 
@@ -99,9 +138,10 @@ This builds `json-exposer` — a ~60-line, dependency-free Go server vendored in
 3. Prefix the field with `<component>_`, e.g. `cpu_physical_cores`.
 4. Check `outputs/` first to make sure the field name isn't already used.
 
-## Why not NetBox or a spreadsheet?
+## Why not NetBox or a hand-kept spreadsheet?
 
 - No database, no UI to configure.
+- The spreadsheet is generated from the fleet every run, so it never drifts from reality.
 - Adding a field is a 3-line shell command, not a migration.
 - Output is plain JSON — easy to convert to CSV, SQL, or a report.
 - Sits right next to your Grafana dashboards, on the same IP/hostname keys.

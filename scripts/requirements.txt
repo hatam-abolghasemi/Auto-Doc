@@ -1,0 +1,6 @@
+# Control-node only — targets never need Python.
+openpyxl>=3.1
+google-api-python-client>=2.100
+google-auth>=2.20
+# httplib2 ignores HTTPS_PROXY without it
+PySocks>=1.7
