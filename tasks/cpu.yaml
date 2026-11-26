@@ -36,6 +36,8 @@
       target_name: "{{ target_name }}"
       target_ip: "{{ ansible_host }}"
       target_group: "{{ target_group }}"
+      target_dc: "{{ target_dc | default('unknown') }}"
+      target_subnet_group: "{{ target_subnet_group | default('unknown') }}"
       cpu_vendor_id: "{{ stats[0] | default('unknown') }}"
       cpu_bios_vendor_id: "{{ stats[1] | default('none') }}"
       cpu_model_name: "{{ stats[2] | default('unknown') }}"

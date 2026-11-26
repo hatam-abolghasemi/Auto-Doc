@@ -49,6 +49,8 @@
         "target_name": target_name,
         "target_ip": ansible_host,
         "target_group": target_group,
+        "target_dc": target_dc | default("unknown"),
+        "target_subnet_group": target_subnet_group | default("unknown"),
         "storage_mountpoint": (item.split('|'))[0],
         "storage_device_name": (item.split('|'))[1],
         "storage_fstype": (item.split('|'))[2],

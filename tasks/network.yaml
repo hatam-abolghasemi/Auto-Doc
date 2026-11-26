@@ -39,6 +39,8 @@
         "target_ip": n[2],
         "target_name": target_name,
         "target_group": target_group,
+        "target_dc": target_dc | default("unknown"),
+        "target_subnet_group": target_subnet_group | default("unknown"),
         "network_ip": n[2],
         "network_subnet": n[1],
         "network_device": n[0],

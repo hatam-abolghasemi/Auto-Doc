@@ -43,6 +43,8 @@
       target_name: "{{ target_name }}"
       target_ip: "{{ ansible_host }}"
       target_group: "{{ target_group }}"
+      target_dc: "{{ target_dc | default('unknown') }}"
+      target_subnet_group: "{{ target_subnet_group | default('unknown') }}"
       os_name: "{{ os[0] }}"
       os_version: "{{ os[1] }}"
       os_codename: "{{ os[2] }}"

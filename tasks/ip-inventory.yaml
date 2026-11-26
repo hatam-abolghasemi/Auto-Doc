@@ -32,8 +32,8 @@
           end;
         strip_domain | loop;
 
-      # lookup: subnet -> { network_ip -> {name: target_name, group: target_group} }
-      (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: ($e.target_group | trim_group)})) as $lookup
+      # lookup: subnet -> { network_ip -> {name, group, dc, subnet_group} }
+      (reduce .[] as $e ({}; .[$e.network_subnet][$e.network_ip] = {name: $e.target_name, group: ($e.target_group | trim_group), dc: ($e.target_dc // "-"), subnet_group: ($e.target_subnet_group // "-")})) as $lookup
 
       # per-subnet metadata: subnet string, key segment (3rd octet), base (first 3 octets)
       | ($lookup | keys | sort) as $subnets
@@ -46,7 +46,7 @@
             }
         ] as $meta
 
-      # one row per host octet 1..254, one ip/target_name/target_group triplet per subnet
+      # one row per host octet 1..254, one ip/target_name/target_group/target_dc/target_subnet_group set per subnet
       | [
           range(1; 255) as $host
           | reduce $meta[] as $m (
@@ -54,7 +54,9 @@
               . + {
                 ("subnet_" + $m.seg + "_ip"): ($m.base + "." + ($host | tostring)),
                 ("subnet_" + $m.seg + "_target_name"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].name // "-"),
-                ("subnet_" + $m.seg + "_target_group"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].group // "-")
+                ("subnet_" + $m.seg + "_target_group"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].group // "-"),
+                ("subnet_" + $m.seg + "_target_dc"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].dc // "-"),
+                ("subnet_" + $m.seg + "_target_subnet_group"): ($lookup[$m.subnet][$m.base + "." + ($host | tostring)].subnet_group // "-")
               }
             )
         ]
