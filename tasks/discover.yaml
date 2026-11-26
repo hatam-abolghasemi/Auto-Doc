@@ -24,13 +24,32 @@
       set -uo pipefail
       PORT="{{ discovery_ssh_port | default(22) }}"
 
-      # How long a single ssh attempt (one user+key combo, one host) is allowed
-      # to run before it's killed outright. ConnectTimeout only bounds the TCP
-      # handshake -- a stuck auth negotiation (gssapi, a passphrase-protected
-      # key, an oddly behaving server) can still hang past that, so every ssh
-      # call below is wrapped in `timeout` as a hard backstop. Nothing is left
-      # running longer than this, ever.
-      SSH_TRY_TIMEOUT="{{ discovery_ssh_timeout | default(6) }}"
+      # Total time budget PER HOST, in seconds -- shared across every user+key
+      # combination tried against that host. A host is never worked longer than
+      # this no matter how many keys exist, because each ssh call is wrapped in
+      # `timeout` with only the remaining budget. This is the hard "maximum 120s
+      # per host" cap.
+      SSH_TRY_TIMEOUT="{{ discovery_ssh_timeout | default(120) }}"
+
+      # Connect timeout for a single ssh attempt.
+      CONNECT_TIMEOUT="{{ discovery_ssh_connect_timeout | default(20) }}"
+
+      # Hosts that have port 22 open but did not answer for a reason other than
+      # an auth refusal (timeout, reset, closed during banner exchange, refused,
+      # no stderr at all...) get re-probed: RETRY_ROUNDS more rounds, each after
+      # RETRY_DELAY seconds, with the longer RETRY_CONNECT_TIMEOUT and a fresh
+      # SSH_TRY_TIMEOUT budget. Auth refusals are never retried -- another try
+      # gets the same answer.
+      RETRY_ROUNDS="{{ discovery_ssh_retries | default(2) }}"
+      RETRY_CONNECT_TIMEOUT="{{ discovery_ssh_retry_connect_timeout | default(45) }}"
+      RETRY_DELAY="{{ discovery_ssh_retry_delay | default(10) }}"
+
+      # ssh errors that mean "this credential/host will refuse us every time".
+      AUTH_REFUSAL='permission denied|too many authentication failures|host key verification failed|unable to negotiate|no matching|no supported authentication'
+
+      # discovery_ssh_bypass_proxy: true adds -o ProxyCommand=none to every
+      # discovery probe and to the collectors' connections. See ssh_opts_for_key.
+      BYPASS_PROXY="{{ discovery_ssh_bypass_proxy | default(false) | bool | lower }}"
 
       # Users to try per host, in order, until one authenticates.
       IFS=',' read -ra SSH_USERS <<< "{{ discovery_ssh_users | default([discovery_ssh_user | default('root')]) | join(',') }}"
@@ -40,14 +59,35 @@
       # need to set this at all.
       CONFIGURED_KEYS_CSV="{{ (discovery_ssh_keys | default([]) + ([discovery_ssh_key] if discovery_ssh_key is defined else [])) | join(',') }}"
 
+      # Every private key sitting in this directory is tried, in addition to the
+      # configured ones and whatever `ssh -G` resolves. This is what picks up
+      # non-standard key names (e.g. ~/.ssh/jenkins) that ssh wouldn't try
+      # on its own. A file counts as a private key if it is not a .pub/cert,
+      # not known_hosts/config/authorized_keys, and its first line says
+      # "PRIVATE KEY". Built once here and reused for every host.
+      KEY_DIR="{{ discovery_ssh_key_dir | default(lookup('env', 'HOME') ~ '/.ssh') }}"
+      AUTO_KEYS=()
+      if [ -d "$KEY_DIR" ]; then
+        for _kf in "$KEY_DIR"/*; do
+          [ -f "$_kf" ] || continue
+          case "$_kf" in
+            *.pub|*-cert.pub) continue ;;
+            */known_hosts|*/known_hosts.old|*/config|*/authorized_keys) continue ;;
+          esac
+          head -n1 "$_kf" 2>/dev/null | grep -q 'PRIVATE KEY' || continue
+          AUTO_KEYS+=("$_kf")
+        done
+      fi
+
       ssh_opts_for_key() {
         local key="$1"
+        local connect_timeout="${2:-$CONNECT_TIMEOUT}"
         SSH_OPTS_CUR=(
           -o BatchMode=yes
-          -o ConnectTimeout=3
+          -o ConnectTimeout="$connect_timeout"
           -o ConnectionAttempts=1
-          -o ServerAliveInterval=3
-          -o ServerAliveCountMax=1
+          -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
           -o PreferredAuthentications=publickey
           -o GSSAPIAuthentication=no
           -o StrictHostKeyChecking=accept-new
@@ -55,8 +95,19 @@
           -o LogLevel=ERROR
           -p "$PORT"
         )
+        # Opt-in: bypass any global ProxyCommand (e.g. SSSD's
+        # sss_ssh_knownhostsproxy set for '*' in /etc/ssh/ssh_config), which can
+        # stall past ConnectTimeout and make discovery miss most hosts. Off by
+        # default, since it would also skip jump hosts configured that way.
+        if [ "$BYPASS_PROXY" = "true" ]; then
+          SSH_OPTS_CUR+=(-o ProxyCommand=none)
+        fi
         if [ "$key" != "__default__" ]; then
-          SSH_OPTS_CUR+=(-i "$key")
+          # IdentitiesOnly=yes makes this attempt offer ONLY this one key, not
+          # every agent/default key as well. Without it, probing many keys can
+          # blow past the server's MaxAuthTries (default 6) -> "Too many
+          # authentication failures", which can even mask a key that works.
+          SSH_OPTS_CUR+=(-i "$key" -o IdentitiesOnly=yes)
         fi
       }
 
@@ -82,6 +133,14 @@
         for k in "${configured[@]}"; do
           k="$(echo "$k" | xargs)"
           [ -n "$k" ] && keys+=("$k")
+        done
+        # Then every private key auto-discovered in KEY_DIR (deduped).
+        for k in "${AUTO_KEYS[@]}"; do
+          dup=0
+          for existing in "${keys[@]}"; do
+            [ "$existing" = "$k" ] && dup=1 && break
+          done
+          [ "$dup" -eq 0 ] && keys+=("$k")
         done
         while IFS= read -r f; do
           [ -n "$f" ] || continue
@@ -114,13 +173,23 @@
         done | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
       )
 
-      CONCURRENCY=50
+      CONCURRENCY=200
       ALL_RESULTS=()
       PROGRESS_LOG="{{ playbook_dir }}/outputs/.discovery_progress.log"
       : > "$PROGRESS_LOG"
       log_progress() {
         echo "[$(date '+%H:%M:%S')] $*" >> "$PROGRESS_LOG"
       }
+      # Every open-22 host that does NOT authenticate is recorded here with its
+      # ssh error, so the hosts dropped from the fleet can be triaged (wrong
+      # credentials vs a real timeout vs not-a-login-server) instead of vanishing.
+      FAIL_LOG="{{ playbook_dir }}/outputs/.discovery_failures.log"
+      : > "$FAIL_LOG"
+      # Hosts that failed the first probe for a non-auth reason and then
+      # answered on a retry: ip|round|first error. A host that shows up here on
+      # some nights is flaky at that hour, not misconfigured.
+      RETRY_LOG="{{ playbook_dir }}/outputs/.discovery_retries.log"
+      : > "$RETRY_LOG"
       # Counts array elements via a positional-parameter trick instead of
       # bash's usual array-length syntax, because that syntax's dollar-brace-
       # hash opening sequence is misread by Ansible's Jinja templating as a
@@ -194,60 +263,150 @@
       # All subnets feed into a single CONCURRENCY-limited pool here instead
       # of each subnet getting its own separate batch, so probing for subnet
       # #2 isn't blocked waiting on subnet #1 to fully finish.
-      probed=0
-      total_to_probe=$(arrlen "${ALL_OPEN_IPS[@]}")
+      # Probes one host with every user+key until one authenticates. Prints one
+      # line:
+      #   OK|ip|hostname|group|user|key
+      #   FAIL|ip|rc=N|error           only auth refusals -- not worth retrying
+      #   RETRY|ip|rc=N|error          at least one attempt failed for another
+      #                                reason (it may have been the right key)
+      # The non-auth error is kept even when later keys were refused, since it
+      # may have hit the key that works; logging only the last error used to
+      # make those hosts look like plain "Permission denied".
+      probe_host() {
+        local ip="$1" connect_timeout="$2"
+        local hostname="" last_err="" last_rc=0 soft_err="" soft_rc=0 err_line remaining user key
+        local errf
+        errf=$(mktemp)
+        local -a KEYS_FOR_IP
+        mapfile -t KEYS_FOR_IP < <(get_keys_for_target "$ip")
+        # One shared SSH_TRY_TIMEOUT budget for this host: every user+key
+        # attempt draws from the same deadline, so trying many keys can never
+        # push a single host past the cap.
+        local deadline=$(( SECONDS + SSH_TRY_TIMEOUT ))
+        for user in "${SSH_USERS[@]}"; do
+          for key in "${KEYS_FOR_IP[@]}"; do
+            remaining=$(( deadline - SECONDS ))
+            if [ "$remaining" -le 0 ]; then
+              last_rc=124
+              last_err="hard timeout after ${SSH_TRY_TIMEOUT}s (budget exhausted)"
+              [ -z "$soft_err" ] && soft_err="$last_err" && soft_rc=124
+              break 2
+            fi
+            ssh_opts_for_key "$key" "$connect_timeout"
+            hostname=$(timeout "$remaining" ssh "${SSH_OPTS_CUR[@]}" "${user}@${ip}" "hostname" 2>"$errf")
+            last_rc=$?
+            if [ -n "$hostname" ]; then
+              rm -f "$errf"
+              printf 'OK|%s|%s|%s|%s|%s\n' "$ip" "$hostname" "$(derive_group "$hostname")" "$user" "$key"
+              return
+            fi
+            # Keep the most telling line of this attempt's stderr for triage.
+            err_line=$(grep -iE 'denied|timed out|refused|closed|unreachable|no route|host key|not known|reset|too many|banner|kex_exchange' "$errf" | tail -n1)
+            [ -z "$err_line" ] && err_line=$(tail -n1 "$errf")
+            [ "$last_rc" = "124" ] && err_line="hard timeout after ${SSH_TRY_TIMEOUT}s"
+            [ -z "$err_line" ] && err_line="no error output"
+            last_err="$err_line"
+            if ! grep -qiE "$AUTH_REFUSAL" <<< "$err_line"; then
+              [ -z "$soft_err" ] && soft_err="$err_line" && soft_rc="$last_rc"
+            fi
+          done
+        done
+        rm -f "$errf"
+        if [ -n "$soft_err" ]; then
+          if [ "$soft_err" = "$last_err" ]; then
+            printf 'RETRY|%s|rc=%s|%s\n' "$ip" "$soft_rc" "$soft_err"
+          else
+            printf 'RETRY|%s|rc=%s|%s (last attempt: %s)\n' "$ip" "$soft_rc" "$soft_err" "$last_err"
+          fi
+        else
+          printf 'FAIL|%s|rc=%s|%s\n' "$ip" "$last_rc" "$last_err"
+        fi
+      }
 
-      mapfile -t ALL_RESULTS < <(
-        for ip in "${ALL_OPEN_IPS[@]}"; do
-          (
-            hostname=""
-            auth_user=""
-            auth_key=""
-            mapfile -t KEYS_FOR_IP < <(get_keys_for_target "$ip")
-            for user in "${SSH_USERS[@]}"; do
-              for key in "${KEYS_FOR_IP[@]}"; do
-                ssh_opts_for_key "$key"
-                hostname=$(timeout "$SSH_TRY_TIMEOUT" ssh "${SSH_OPTS_CUR[@]}" "${user}@${ip}" "hostname" 2>/dev/null)
-                if [ -n "$hostname" ]; then
-                  auth_user="$user"
-                  auth_key="$key"
-                  break 2
-                fi
-              done
-            done
-            [ -z "$hostname" ] && exit 0
+      derive_group() {
+        local group="$1" stripped=1 suf
+        while [ "$stripped" -eq 1 ]; do
+          stripped=0
+          for suf in "${DOMAIN_SUFFIXES[@]}"; do
+            if [[ "$group" == *".${suf}" ]]; then
+              group="${group%.${suf}}"
+              stripped=1
+              break
+            fi
+          done
+        done
+        # strip any trailing run of non-letter characters (digits, dashes,
+        # dots, etc.) one char at a time until the group ends in a letter
+        # (e.g. "worker8" -> "worker", "node-104037" -> "node",
+        # "app.stg-" -> "app.stg" -> "app")
+        while [[ "$group" =~ [^A-Za-z]$ ]]; do
+          group="${group%?}"
+        done
+        echo "$group"
+      }
 
-            group="$hostname"
-            stripped=1
-            while [ "$stripped" -eq 1 ]; do
-              stripped=0
-              for suf in "${DOMAIN_SUFFIXES[@]}"; do
-                if [[ "$group" == *".${suf}" ]]; then
-                  group="${group%.${suf}}"
-                  stripped=1
-                  break
-                fi
-              done
-            done
-            # strip any trailing run of non-letter characters (digits, dashes,
-            # dots, etc.) one char at a time until the group ends in a letter
-            # (e.g. "worker8" -> "worker", "node-104037" -> "node",
-            # "app.stg-" -> "app.stg" -> "app")
-            while [[ "$group" =~ [^A-Za-z]$ ]]; do
-              group="${group%?}"
-            done
-
-            printf '%s|%s|%s|%s|%s\n' "$ip" "$hostname" "$group" "$auth_user" "$auth_key"
-          ) &
+      # Runs probe_host over the given ips in one CONCURRENCY-limited pool.
+      # $1 = connect timeout, $2 = progress label, rest = ips.
+      probe_pool() {
+        local connect_timeout="$1" label="$2"; shift 2
+        local total=$# probed=0 ip
+        for ip in "$@"; do
+          ( probe_host "$ip" "$connect_timeout" ) &
           while (( $(jobs -r | wc -l) >= CONCURRENCY )); do
             wait -n
             probed=$((probed + 1))
-            (( probed % 25 == 0 )) && log_progress "phase 2: probed ~${probed}/${total_to_probe} host(s)"
+            (( probed % 25 == 0 )) && log_progress "${label}: probed ~${probed}/${total} host(s)"
           done
         done
         wait
-      )
-      log_progress "phase 2 complete: $(arrlen "${ALL_RESULTS[@]}") host(s) authenticated and responded"
+      }
+
+      total_to_probe=$(arrlen "${ALL_OPEN_IPS[@]}")
+      declare -A FIRST_ERR
+      declare -A LAST_LINE
+      RETRY_IPS=()
+      while IFS= read -r line; do
+        case "$line" in
+          OK\|*)    ALL_RESULTS+=("${line#OK|}") ;;
+          FAIL\|*)  echo "${line#FAIL|}" >> "$FAIL_LOG" ;;
+          RETRY\|*) rest="${line#RETRY|}"; ip="${rest%%|*}"
+                    RETRY_IPS+=("$ip"); FIRST_ERR[$ip]="${rest#*|}"; LAST_LINE[$ip]="$rest" ;;
+        esac
+      done < <(probe_pool "$CONNECT_TIMEOUT" "phase 2" "${ALL_OPEN_IPS[@]}")
+      log_progress "phase 2: first pass done -- $(arrlen "${ALL_RESULTS[@]}") authenticated, $(arrlen "${RETRY_IPS[@]}") to retry (non-auth errors)"
+
+      # --- Phase 2b: retry hosts that failed for a non-auth reason. ----------
+      round=0
+      while [ "$round" -lt "$RETRY_ROUNDS" ] && [ "$(arrlen "${RETRY_IPS[@]}")" -gt 0 ]; do
+        round=$((round + 1))
+        sleep "$RETRY_DELAY"
+        log_progress "phase 2b: retry ${round}/${RETRY_ROUNDS} for $(arrlen "${RETRY_IPS[@]}") host(s), ConnectTimeout=${RETRY_CONNECT_TIMEOUT}s"
+        NEXT_RETRY=()
+        while IFS= read -r line; do
+          case "$line" in
+            OK\|*)    rest="${line#OK|}"; ip="${rest%%|*}"
+                      ALL_RESULTS+=("$rest")
+                      printf '%s|retry %s|%s\n' "$ip" "$round" "${FIRST_ERR[$ip]}" >> "$RETRY_LOG" ;;
+            FAIL\|*)  echo "${line#FAIL|}" >> "$FAIL_LOG" ;;
+            RETRY\|*) rest="${line#RETRY|}"; ip="${rest%%|*}"
+                      NEXT_RETRY+=("$ip"); LAST_LINE[$ip]="$rest" ;;
+          esac
+        done < <(probe_pool "$RETRY_CONNECT_TIMEOUT" "phase 2b retry ${round}" "${RETRY_IPS[@]}")
+        log_progress "phase 2b: retry ${round} recovered $(( $(arrlen "${RETRY_IPS[@]}") - $(arrlen "${NEXT_RETRY[@]}") )) host(s)"
+        RETRY_IPS=("${NEXT_RETRY[@]}")
+      done
+      for ip in "${RETRY_IPS[@]}"; do
+        echo "${LAST_LINE[$ip]} [after ${round} retr$( [ "$round" -eq 1 ] && echo y || echo ies )]" >> "$FAIL_LOG"
+      done
+
+      # Every probed host ends up in exactly one place: an authenticated result
+      # line or a line in FAIL_LOG. So authed + failed is the exact number of
+      # hosts probed -- no racy job counting needed -- and it equals the count
+      # found in phase 1.
+      authed=$(arrlen "${ALL_RESULTS[@]}")
+      failed=$(wc -l < "$FAIL_LOG" | tr -d ' ')
+      recovered=$(wc -l < "$RETRY_LOG" | tr -d ' ')
+      log_progress "phase 2 complete: probed $(( authed + failed ))/${total_to_probe} host(s) -- ${authed} authenticated (${recovered} only on retry, see outputs/.discovery_retries.log), ${failed} did not (see outputs/.discovery_failures.log)"
 
       resolve_primary_ip() {
         local hostname="$1"; shift
@@ -374,11 +533,29 @@
     content: "{{ discovery_raw.stdout }}\n"
     mode: '0644'
 
+- name: "Build the subnet -> datacenter lookup table from subnets.yaml"
+  set_fact:
+    subnet_ranges: >-
+      {%- set out = [] -%}
+      {%- for s in autodoc_subnets | default([]) -%}
+        {%- set net, pfx = s.cidr.split('/') -%}
+        {%- set o = net.split('.') | map('int') | list -%}
+        {%- set start = o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] -%}
+        {%- set _ = out.append({'start': start, 'end': start + 2 ** (32 - pfx | int) - 1, 'prefix': pfx | int,
+                                'dc': s.dc, 'subnet_group': s.subnet_group}) -%}
+      {%- endfor -%}
+      {{ out | to_json | from_json }}
+
 - name: "Write hosts.yaml as a plain output record (not read back as inventory)"
   ansible.builtin.shell:
     executable: /bin/bash
     cmd: |
-      jq -R -s '
+      jq -R -s --argjson ranges '{{ subnet_ranges | to_json }}' '
+        # most specific subnets.yaml entry holding this ip, else unknown
+        def placement($ip):
+          ($ip | split(".") | map(tonumber) | .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3]) as $n
+          | ([$ranges[] | select(.start <= $n and $n <= .end)] | sort_by(-.prefix) | .[0])
+            // {dc: "unknown", subnet_group: "unknown"};
         split("\n") | map(select(length > 0)) | map(split("|"))
         | map({
             ip: .[0], hostname: .[1], group: .[2],
@@ -397,6 +574,8 @@
                   ansible_host: .ip,
                   target_name: .hostname,
                   target_group: .group,
+                  target_dc: placement(.ip).dc,
+                  target_subnet_group: placement(.ip).subnet_group,
                   extra_ips: .extra_ips,
                   ip_source: .ip_source,
                   ansible_user: .auth_user
@@ -443,6 +622,8 @@
     ansible_host: "{{ item.ip }}"
     target_name: "{{ item.hostname }}"
     target_group: "{{ item.group }}"
+    target_dc: "{{ placement.dc }}"
+    target_subnet_group: "{{ placement.subnet_group }}"
     extra_ips: "{{ item.extra_ips }}"
     ip_source: "{{ item.ip_source }}"
     ansible_user: "{{ item.auth_user }}"
@@ -451,6 +632,17 @@
   loop: "{{ discovered_hosts_list }}"
   loop_control:
     label: "{{ item.hostname }} ({{ item.ip }})"
+  vars:
+    # most specific subnets.yaml entry holding this ip, else unknown
+    ip_octets: "{{ item.ip.split('.') | map('int') | list }}"
+    ip_number: "{{ ip_octets[0] * 16777216 + ip_octets[1] * 65536 + ip_octets[2] * 256 + ip_octets[3] }}"
+    placement: >-
+      {{ subnet_ranges
+         | selectattr('start', 'le', ip_number | int)
+         | selectattr('end', 'ge', ip_number | int)
+         | sort(attribute='prefix', reverse=true)
+         | first
+         | default({'dc': 'unknown', 'subnet_group': 'unknown'}, true) }}
 
 - name: Report discovery summary
   ansible.builtin.debug:

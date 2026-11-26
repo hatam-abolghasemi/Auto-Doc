@@ -3,8 +3,22 @@
   hosts: localhost
   connection: local
   gather_facts: no
+  vars_files:
+    - subnets.yaml
   vars:
-    subnets: "192.168.104.0,192.168.200.0"
+    # Every /24 covered by subnets.yaml (entries with `scan: false` skipped),
+    # comma-separated. Override with -e subnets=... for a one-off scan.
+    subnets: >-
+      {%- set out = [] -%}
+      {%- for s in autodoc_subnets if s.scan | default(true) -%}
+        {%- set net, pfx = s.cidr.split('/') -%}
+        {%- set o = net.split('.') | map('int') | list -%}
+        {%- for i in range(2 ** (24 - [pfx | int, 24] | min)) -%}
+          {%- set c = o[0] ~ '.' ~ o[1] ~ '.' ~ (o[2] + i) ~ '.0' -%}
+          {%- if c not in out -%}{%- set _ = out.append(c) -%}{%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out | join(',') }}
     exclude_ips: []
   tasks:
     - name: "Expose subnets to later plays via hostvars['localhost']"
@@ -23,10 +37,11 @@
     ansible_ssh_common_args: >-
       -o ConnectTimeout=120
       -o ConnectionAttempts=1
+      {{ '-o ProxyCommand=none' if discovery_ssh_bypass_proxy | default(false) | bool else '' }}
   tasks:
     - block:
         - name: Create Component-Based View
-          include_tasks: "./tasks/{{ item }}.yaml"
+          include_tasks: "./tasks/{{ component }}.yaml"
           loop:
             - os
             - cpu
@@ -36,6 +51,8 @@
             - tools
             - docker
             - ip-inventory
+          loop_control:
+            loop_var: component
       ignore_errors: true
 
 - name: Publish documentation as a spreadsheet

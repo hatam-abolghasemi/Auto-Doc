@@ -1,0 +1,26 @@
+# Subnet -> datacenter map. Hand-maintained; replace these examples with your own.
+#
+# Every machine gets target_dc and target_subnet_group from the entry that
+# holds its IP (the most specific CIDR wins, so a /28 inside a /24 beats the
+# /24). An IP that matches nothing is "unknown" for both.
+#
+# The same list drives discovery: each CIDR is expanded into /24s and scanned,
+# so a /22 scans four /24s. Set `scan: false` on an entry to keep it for
+# labelling only. `-e subnets=10.42.7.0,10.42.8.0` still overrides the scan list
+# for a one-off run.
+#
+# Fields:
+#   cidr          network/prefix (required)
+#   dc            datacenter (required)
+#   subnet_group  short lowercase label used in the outputs (required)
+#   scan          false to skip it during discovery (default: true)
+#   vlan          VLAN ID, for reference
+#   name          VLAN name as your network team writes it, for reference
+#   gateway       for reference
+
+autodoc_subnets:
+  # ---------------------------------------------------------------- dc1
+  - {cidr: 10.42.7.0/24,  dc: dc1, subnet_group: production, vlan: 7,  name: "Production", gateway: 10.42.7.1}
+  - {cidr: 10.42.9.0/28,  dc: dc1, subnet_group: mgmt,       vlan: 9,  name: "MGMT - iLO",  scan: false}
+  # ---------------------------------------------------------------- dc2
+  - {cidr: 10.43.0.0/22,  dc: dc2, subnet_group: staging,    vlan: 40, name: "Staging",    gateway: 10.43.0.1}
