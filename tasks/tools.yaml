@@ -35,16 +35,21 @@
         cmd: "teleport version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/v//'"
       - name: zabbix_agent2
         cmd: "zabbix_agent2 --version 2>/dev/null | grep -E '^zabbix_agent2' | sed -E 's/.*\\) ([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/'"
-- name: Check binary tools on target (Strict RAW)
+- name: Check binary tools on target (single pass, one SSH round-trip)
+  # Was a loop that opened one SSH exec per tool (16 round-trips per host).
+  # The definitions are now rendered into a single script that checks every
+  # tool in one connection; output is one pipe-delimited line per found tool,
+  # identical in format to before.
   raw: |
-    T_NAME={{ item.name | quote }}
-    T_CMD={{ item.cmd | quote }}
-    T_FALLBACK={{ (item.path | default('')) | quote }}
-    T_PATH=$(which "$T_NAME" 2>/dev/null)
-    if [ -z "$T_PATH" ] && [ -n "$T_FALLBACK" ] && [ -x "$T_FALLBACK" ]; then
-        T_PATH="$T_FALLBACK"
-    fi
-    if [ -n "$T_PATH" ]; then
+    check_tool() {
+        T_NAME="$1"
+        T_CMD="$2"
+        T_FALLBACK="$3"
+        T_PATH=$(which "$T_NAME" 2>/dev/null)
+        if [ -z "$T_PATH" ] && [ -n "$T_FALLBACK" ] && [ -x "$T_FALLBACK" ]; then
+            T_PATH="$T_FALLBACK"
+        fi
+        [ -z "$T_PATH" ] && return 0
         S_NAME="$T_NAME"
         [ "$T_NAME" = "zabbix_agent2" ] && S_NAME="zabbix-agent2"
         T_VER=$(eval "$T_CMD" | tr -d '\r\n')
@@ -55,9 +60,11 @@
         T_PORTS=$(ss -ntlp 2>/dev/null | grep -E "\"$T_NAME\"|:$T_NAME |\"$S_NAME\"|:$S_NAME " | awk '{print $4}' | awk -F: '{print $NF}' | sort -u | tr '\n' ',' | sed 's/,$//')
         [ -z "$T_PORTS" ] && T_PORTS="none"
         printf "%s|%s|%s|%s|%s|%s|%s\n" "$T_NAME" "$T_VER" "$T_PATH" "$T_MGR" "$T_STATE" "$T_ENBL" "$T_PORTS"
-    fi
+    }
+    {% for t in tool_definitions %}
+    check_tool {{ t.name | quote }} {{ t.cmd | quote }} {{ (t.path | default('')) | quote }}
+    {% endfor %}
   register: tool_check
-  loop: "{{ tool_definitions }}"
   failed_when: false
   changed_when: false
 
@@ -72,19 +79,20 @@
         "target_name": target_name,
         "target_ip": ansible_host,
         "target_group": target_group,
-        "tool_name": (item.stdout | trim | split('|'))[0],
-        "tool_version": (item.stdout | trim | split('|'))[1],
-        "tool_path": (item.stdout | trim | split('|'))[2],
-        "tool_manager": (item.stdout | trim | split('|'))[3],
-        "tool_status": (item.stdout | trim | split('|'))[4],
-        "tool_enabled": (item.stdout | trim | split('|'))[5],
-        "tool_ports": (item.stdout | trim | split('|'))[6]
+        "target_dc": target_dc | default("unknown"),
+        "target_subnet_group": target_subnet_group | default("unknown"),
+        "tool_name": (item | trim | split('|'))[0],
+        "tool_version": (item | trim | split('|'))[1],
+        "tool_path": (item | trim | split('|'))[2],
+        "tool_manager": (item | trim | split('|'))[3],
+        "tool_status": (item | trim | split('|'))[4],
+        "tool_enabled": (item | trim | split('|'))[5],
+        "tool_ports": (item | trim | split('|'))[6]
       }] }}
-  when: 
-    - item.stdout is defined 
-    - item.stdout | trim != ""
-    - (item.stdout | trim | split('|') | length) == 7
-  loop: "{{ tool_check.results }}"
+  when:
+    - item | trim != ""
+    - (item | trim | split('|') | length) == 7
+  loop: "{{ tool_check.stdout_lines | default([]) }}"
 
 - name: Generate tools JSON
   delegate_to: localhost
