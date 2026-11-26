@@ -11,6 +11,7 @@ Auto-Doc is an Ansible playbook that discovers your servers and documents them a
 ## Features
 
 - **Auto-discovery** — give it subnets, it finds the machines. No inventory file to maintain by hand.
+- **Datacenter-aware** — every record carries `target_dc` and `target_subnet_group`, looked up from one hand-maintained `subnets.yaml`, which is also the scan list.
 - **Naming-agnostic grouping** — machines are grouped by stripping the trailing number off their hostname (e.g. `redis-01`, `redis-02` → group `redis`). No hardcoded role list to update.
 - **Correct static IP detection** — if a machine answers on more than one IP (a real static IP plus a floating one), Auto-Doc figures out which is the real one using netplan config, falling back to the default route, and flags anything it had to guess.
 - **One-run convergence** — discovery and documentation happen in a single `ansible-playbook` command. No second run needed to pick up new machines.
@@ -37,6 +38,7 @@ Then import `dashboard.json` into Grafana. You'll get the fully populated view a
 ```
 .
 ├── main.yaml               # runs discovery, then all the collectors
+├── subnets.yaml             # subnet -> datacenter map; also the scan list
 ├── ansible.cfg              # points the default inventory at hosts.yaml
 ├── hosts.yaml               # output record only, not read as input
 ├── docker-compose.yml       # serves outputs/ over HTTP for Grafana
@@ -77,14 +79,52 @@ Then import `dashboard.json` into Grafana. You'll get the fully populated view a
 ansible-playbook main.yaml
 ```
 
-That's it — no `-i` flag needed. Subnets are set in the `subnets` var at the top of `main.yaml`.
+That's it — no `-i` flag needed. What gets scanned comes from `subnets.yaml` (see below).
 
 What happens:
-1. `discover` scans those subnets, SSHes into whatever it finds, and figures out each machine's hostname, group, and real static IP.
+1. `discover` scans those subnets, SSHes into whatever it finds, and figures out each machine's hostname, group, datacenter, and real static IP. Hosts that answer on port 22 but fail for a reason other than an auth refusal (timeout, reset, connection closed during the banner exchange...) are retried; see [Discovery tuning](#discovery-tuning).
 2. Those machines are used immediately by the rest of the same run — `os`, `cpu`, `memory`, `storage`, `network`, `tools`, `docker`, `ip-inventory` — each writing its own file to `outputs/`.
 3. `sheets` turns `outputs/` into `outputs/auto-doc.xlsx` and, if configured, publishes it to Google Sheets.
 
 `outputs/` is gitignored on purpose — it's your real fleet's data (hostnames, IPs, installed tool versions). Don't commit it.
+
+## Subnets and datacenters
+
+`subnets.yaml` lists every known range with the datacenter it lives in and a short subnet-group label:
+
+```yaml
+autodoc_subnets:
+  - {cidr: 10.42.7.0/24, dc: dc1, subnet_group: production, vlan: 7, name: "Production", gateway: 10.42.7.1}
+  - {cidr: 10.42.9.0/28, dc: dc1, subnet_group: mgmt, scan: false}
+  - {cidr: 10.43.0.0/22, dc: dc2, subnet_group: staging}
+```
+
+It does two jobs:
+
+- **Placement.** At discovery, each machine's IP is matched against the list; the most specific CIDR wins (a /28 beats the /24 around it). The result is written as `target_dc` and `target_subnet_group` next to `target_name` / `target_group` in `hosts.yaml` and every output JSON file. No match means `unknown` for both.
+- **Scan list.** Every CIDR is expanded into /24s and scanned, so a /22 scans all four /24s. Add `scan: false` to an entry to keep it for labelling only. A one-off `-e subnets=10.42.7.0,10.42.8.0` still overrides it.
+
+`vlan`, `name` and `gateway` are reference only. When your network team changes the VLAN plan, this file is the only thing to edit. The shipped file holds example ranges; replace them with yours.
+
+## Discovery tuning
+
+All optional, passed with `-e`:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `discovery_ssh_port` | `22` | SSH port probed and used |
+| `discovery_ssh_users` | `[root]` | Users tried on every host, in order |
+| `discovery_ssh_keys` | `[]` | Keys tried first, before any auto-detected ones |
+| `discovery_ssh_key_dir` | `~/.ssh` | Every private key found here is tried too, so non-standard key names get picked up. Each key is offered on its own (`IdentitiesOnly=yes`), so many keys don't trip the server's `MaxAuthTries` |
+| `discovery_ssh_timeout` | `120` | Total seconds one host may take, shared across all user+key attempts |
+| `discovery_ssh_connect_timeout` | `20` | `ConnectTimeout` for one attempt |
+| `discovery_ssh_retries` | `2` | Extra rounds for hosts that failed for a non-auth reason. Auth refusals are never retried |
+| `discovery_ssh_retry_delay` | `10` | Seconds between retry rounds |
+| `discovery_ssh_retry_connect_timeout` | `45` | `ConnectTimeout` used on retries |
+| `discovery_ssh_bypass_proxy` | `false` | Adds `-o ProxyCommand=none` to discovery and collection. Turn it on when a global `ProxyCommand` (e.g. SSSD's `sss_ssh_knownhostsproxy` for `Host *`) stalls connections; leave it off if you reach hosts through a jump host |
+| `discovery_domain_suffix` | example list | Domain suffixes stripped from hostnames before grouping |
+
+After a run, `outputs/.discovery_failures.log` lists every host with port 22 open that never authenticated, with its SSH error, and `outputs/.discovery_retries.log` lists hosts that only answered on a retry. Progress is written to `outputs/.discovery_progress.log`.
 
 ## Viewing it in Grafana
 
@@ -103,8 +143,8 @@ The last play builds `outputs/auto-doc.xlsx` and publishes it to one Google Shee
 | Tab | One row per | Answers |
 |---|---|---|
 | Overview | – | Totals, and what each tab is for |
-| Groups | group | Size, OS mix, total cores/RAM/disk, subnets, top services |
-| Machines | machine | OS, CPU, memory, platform, plus disk/NIC/service/container counts that jump to the details |
+| Groups | group | Size, DC and subnet-group mix, OS mix, total cores/RAM/disk, subnets, top services |
+| Machines | machine | DC, subnet group, OS, CPU, memory, platform, plus disk/NIC/service/container counts that jump to the details. Listed in IP order, with a divider at every /24 |
 | Storage | disk/volume | Mountpoint, device, size (GiB), type, model, read-only |
 | Network | interface | IP, subnet, gateway, MAC, MTU, state, default route |
 | IP Map | last octet | Who holds which IP; one column per /24, gateways marked, blank = free, conflicts in red |
