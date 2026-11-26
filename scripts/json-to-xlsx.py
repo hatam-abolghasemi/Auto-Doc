@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build the Auto-Doc infrastructure workbook from outputs/*.json.
 
-A machine is identified by (target_name, target_ip, target_group) everywhere.
+A machine is identified by (target_name, target_ip, target_group) everywhere;
+target_dc and target_subnet_group (from subnets.yaml) ride along as attributes.
 One-to-one facts (OS, CPU, memory) are merged into Machines; one-to-many facts
 (disks, NICs, services, containers) get their own sheets, linked back to it.
 
@@ -28,7 +29,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-FONT_NAME = "Times New Roman"
+FONT_NAME = "Calibri"
 KEY_FIELDS = ("target_name", "target_ip", "target_group")
 PLACEHOLDERS = {"", "-", "none", "unknown", "n/a", "null", "None"}
 
@@ -90,6 +91,13 @@ def machine_key(row):
 def machine_sort(key):
     name, ip, group = key
     return (natural(group), natural(name), natural(ip))
+
+
+def ip_sort(ip):
+    try:
+        return (0, int(ipaddress.ip_address(str(ip).strip())), "")
+    except ValueError:
+        return (1, 0, str(ip))
 
 
 def gib(value_bytes):
@@ -220,20 +228,25 @@ def build_model(input_dir):
             many[stem][machine_key(r)].append(r)
 
     machines = set()
+    place = {}  # machine -> (target_dc, target_subnet_group), first record that has them
     for stem in raw:
-        machines.update(machine_key(r) for r in raw[stem])
+        for r in raw[stem]:
+            m = machine_key(r)
+            machines.add(m)
+            if m not in place and (clean(r.get("target_dc")) or clean(r.get("target_subnet_group"))):
+                place[m] = (clean(r.get("target_dc")) or "unknown", clean(r.get("target_subnet_group")) or "unknown")
     machines = sorted((m for m in machines if m[0]), key=machine_sort)
-    return machines, one, many
+    return machines, one, many, place
 
 
 # --------------------------------------------------------------------------- sheets
 
-def write_machines(book, links, machines, one, many, rows):
+def write_machines(book, links, machines, one, many, rows, place):
     s = SheetWriter(book, "Machines", COLOR["identity"], links)
-    sections = [("Identity", COLOR["identity"], 3), ("OS", COLOR["os"], 5), ("CPU", COLOR["cpu"], 4),
+    sections = [("Identity", COLOR["identity"], 5), ("OS", COLOR["os"], 5), ("CPU", COLOR["cpu"], 4),
                 ("Memory", COLOR["memory"], 2), ("Storage", COLOR["storage"], 2),
                 ("Network", COLOR["network"], 3), ("Software", COLOR["services"], 2)]
-    columns = ["Name", "IP", "Group",
+    columns = ["Name", "IP", "Group", "DC", "Subnet Group",
                "OS", "Version", "Codename", "Arch", "Timezone",
                "Physical Cores", "Sockets", "Logical CPUs", "Platform",
                "RAM (GiB)", "Online",
@@ -265,8 +278,9 @@ def write_machines(book, links, machines, one, many, rows):
         else:
             platform = None
         ram_kb = to_int(mem.get("memory_size_kb"))
+        dc, subnet_group = place.get(m, ("unknown", "unknown"))
         p = {
-            "key": m, "os": o, "cpu": c, "mem": mem, "platform": platform,
+            "key": m, "dc": dc, "subnet_group": subnet_group, "os": o, "cpu": c, "mem": mem, "platform": platform,
             "os_label": f"{clean(o.get('os_name')) or ''} {clean(o.get('os_version')) or ''}".strip(),
             "phys": to_int(c.get("cpu_physical_cores")), "sockets": to_int(c.get("cpu_sockets")),
             "logical": to_int(c.get("cpu_logical_processors")),
@@ -280,41 +294,49 @@ def write_machines(book, links, machines, one, many, rows):
                 numeric_cols[k].append(p[k])
         prepared.append(p)
     scales = {k: sorted(set(v)) for k, v in numeric_cols.items()}
+    dc_colors = categorical(p["dc"] for p in prepared if p["dc"] != "unknown")
 
+    # Machines is listed in IP order (numeric, so .98 comes before .100), with a
+    # divider wherever the /24 changes. Other sheets keep their group order.
     r = 3
-    last_group = None
-    for p in prepared:
+    last_net = None
+    for p in sorted(prepared, key=lambda p: ip_sort(p["key"][1])):
         m = p["key"]
         rows["machines"][m] = r
-        edge = last_group is not None and m[2] != last_group
-        last_group = m[2]
+        net = _slash24(m[1])
+        edge = last_net is not None and net != last_net
+        last_net = net
         o = p["os"]
         s.put(r, 1, m[0], bold=True, top_edge=edge)
         s.put(r, 2, m[1], top_edge=edge)
         s.link(r, 3, "Groups", rows["groups"].get(m[2], 2), 1, m[2], top_edge=edge)
-        tint = os_versions.get(p["os_label"])
-        s.put(r, 4, clean(o.get("os_name")), bg=tint, top_edge=edge)
-        s.put(r, 5, clean(o.get("os_version")), bg=tint, bold=True, top_edge=edge)
-        s.put(r, 6, clean(o.get("os_codename")), top_edge=edge)
-        s.put(r, 7, clean(o.get("os_architecture")), top_edge=edge)
-        s.put(r, 8, clean(o.get("os_timezone")), top_edge=edge)
-        s.put(r, 9, p["phys"], bg=bucket(p["phys"], scales.get("phys", []), SEQUENTIAL), bold=True, top_edge=edge)
-        s.put(r, 10, p["sockets"], top_edge=edge)
-        s.put(r, 11, p["logical"], bg=bucket(p["logical"], scales.get("logical", []), SEQUENTIAL), top_edge=edge)
-        plat = p["platform"]
-        s.put(r, 12, plat, bg=("EEF2FF" if plat and plat.startswith("VM") else "FDF2E9") if plat else None,
+        unknown = p["dc"] == "unknown"
+        s.put(r, 4, p["dc"], bg=dc_colors.get(p["dc"]), fg=MUTED if unknown else None, bold=not unknown,
               top_edge=edge)
-        s.put(r, 13, p["ram"], bg=bucket(p["ram"], scales.get("ram", []), SEQUENTIAL),
+        s.put(r, 5, p["subnet_group"], fg=MUTED if p["subnet_group"] == "unknown" else None, top_edge=edge)
+        tint = os_versions.get(p["os_label"])
+        s.put(r, 6, clean(o.get("os_name")), bg=tint, top_edge=edge)
+        s.put(r, 7, clean(o.get("os_version")), bg=tint, bold=True, top_edge=edge)
+        s.put(r, 8, clean(o.get("os_codename")), top_edge=edge)
+        s.put(r, 9, clean(o.get("os_architecture")), top_edge=edge)
+        s.put(r, 10, clean(o.get("os_timezone")), top_edge=edge)
+        s.put(r, 11, p["phys"], bg=bucket(p["phys"], scales.get("phys", []), SEQUENTIAL), bold=True, top_edge=edge)
+        s.put(r, 12, p["sockets"], top_edge=edge)
+        s.put(r, 13, p["logical"], bg=bucket(p["logical"], scales.get("logical", []), SEQUENTIAL), top_edge=edge)
+        plat = p["platform"]
+        s.put(r, 14, plat, bg=("EEF2FF" if plat and plat.startswith("VM") else "FDF2E9") if plat else None,
+              top_edge=edge)
+        s.put(r, 15, p["ram"], bg=bucket(p["ram"], scales.get("ram", []), SEQUENTIAL),
               number_format="#,##0.0", bold=True, top_edge=edge)
-        s.put(r, 14, clean(p["mem"].get("memory_total_online_memory")), top_edge=edge)
-        _count_link(s, r, 15, p["disks"], "Storage", rows["storage"].get(m), edge)
-        s.put(r, 16, p["disk_total"], bg=bucket(p["disk_total"], scales.get("disk_total", []), SEQUENTIAL),
+        s.put(r, 16, clean(p["mem"].get("memory_total_online_memory")), top_edge=edge)
+        _count_link(s, r, 17, p["disks"], "Storage", rows["storage"].get(m), edge)
+        s.put(r, 18, p["disk_total"], bg=bucket(p["disk_total"], scales.get("disk_total", []), SEQUENTIAL),
               number_format="#,##0.0", top_edge=edge)
-        _count_link(s, r, 17, p["nics"], "Network", rows["network"].get(m), edge)
-        s.put(r, 18, p["subnets"] or None, top_edge=edge)
-        s.put(r, 19, p["gateway"], top_edge=edge)
-        _count_link(s, r, 20, p["services"], "Services", rows["services"].get(m), edge)
-        _count_link(s, r, 21, p["containers"], "Containers", rows["containers"].get(m), edge)
+        _count_link(s, r, 19, p["nics"], "Network", rows["network"].get(m), edge)
+        s.put(r, 20, p["subnets"] or None, top_edge=edge)
+        s.put(r, 21, p["gateway"], top_edge=edge)
+        _count_link(s, r, 22, p["services"], "Services", rows["services"].get(m), edge)
+        _count_link(s, r, 23, p["containers"], "Containers", rows["containers"].get(m), edge)
         r += 1
 
     s.finish(freeze="D3", filter_row=2, last_row=r - 1, last_col=len(columns))
@@ -624,8 +646,8 @@ def write_groups(book, links, prepared, many, rows, preassign=False):
         return
 
     s = SheetWriter(book, "Groups", COLOR["groups"], links)
-    columns = ["Group", "Machines", "OS", "Platform", "Physical Cores", "Logical CPUs", "RAM (GiB)",
-               "Disk (GiB)", "Subnets", "Top Services"]
+    columns = ["Group", "Machines", "DC", "Subnet Groups", "OS", "Platform", "Physical Cores", "Logical CPUs",
+               "RAM (GiB)", "Disk (GiB)", "Subnets", "Top Services"]
     s.header(1, columns)
 
     def mix(values):
@@ -641,16 +663,18 @@ def write_groups(book, links, prepared, many, rows, preassign=False):
         tools = Counter(clean(t.get("tool_name")) for p in ps for t in many["tools"].get(p["key"], []))
         s.link(r, 1, "Machines", first, 1, g, bold=True)
         s.put(r, 2, len(ps), bold=True)
-        s.put(r, 3, mix(p["os_label"] for p in ps))
-        s.put(r, 4, mix(p["platform"] for p in ps))
-        for col, k, fmt in ((5, "phys", None), (6, "logical", None), (7, "ram", "#,##0.0"),
-                            (8, "disk_total", "#,##0.0")):
+        s.put(r, 3, mix(p["dc"] for p in ps))
+        s.put(r, 4, mix(p["subnet_group"] for p in ps))
+        s.put(r, 5, mix(p["os_label"] for p in ps))
+        s.put(r, 6, mix(p["platform"] for p in ps))
+        for col, k, fmt in ((7, "phys", None), (8, "logical", None), (9, "ram", "#,##0.0"),
+                            (10, "disk_total", "#,##0.0")):
             v = sum(p[k] or 0 for p in ps)
             s.put(r, col, round(v, 1) if isinstance(v, float) else v, number_format=fmt,
                   bg=bucket(v, totals[k], SEQUENTIAL))
         subnets = sorted({_slash24(p["key"][1]) for p in ps if _slash24(p["key"][1])}, key=natural)
-        s.put(r, 9, ", ".join(subnets) or None)
-        s.put(r, 10, ", ".join(f"{t} ×{n}" for t, n in tools.most_common(6) if t) or None)
+        s.put(r, 11, ", ".join(subnets) or None)
+        s.put(r, 12, ", ".join(f"{t} ×{n}" for t, n in tools.most_common(6) if t) or None)
     s.finish(freeze="B2", filter_row=1, last_row=len(groups) + 1, last_col=len(columns), max_width=70)
 
 
@@ -679,8 +703,8 @@ def write_overview(ws, links, stats, generated_at):
         bottom.fill = fill("F6F8FA")
 
     sheets = [
-        ("Groups", "One row per group: size, OS mix, total capacity, subnets, top services.", COLOR["groups"]),
-        ("Machines", "One row per machine: OS, CPU, memory, plus disk/NIC/service/container counts.",
+        ("Groups", "One row per group: size, DC and subnet-group mix, OS mix, total capacity, top services.", COLOR["groups"]),
+        ("Machines", "One row per machine: DC, subnet group, OS, CPU, memory, plus disk/NIC/service/container counts.",
          COLOR["identity"]),
         ("Storage", "Every mounted disk and volume, with size and type.", COLOR["storage"]),
         ("Network", "Every network interface: IP, subnet, gateway, MAC, state.", COLOR["network"]),
@@ -717,7 +741,7 @@ def main():
     parser.add_argument("--output", default="outputs/auto-doc.xlsx")
     args = parser.parse_args()
 
-    machines, one, many = build_model(args.input)
+    machines, one, many, place = build_model(args.input)
     if not machines:
         sys.exit(f"no machines found in {args.input}/*.json; run the collectors first")
 
@@ -752,7 +776,7 @@ def main():
     write_groups(book, links, prepared_stub, many, rows, preassign=True)
 
     groups_ws = book.create_sheet("Groups")          # placeholder keeps tab order
-    prepared = write_machines(book, links, machines, one, many, rows)
+    prepared = write_machines(book, links, machines, one, many, rows, place)
     write_storage(book, links, machines, many, rows)
     write_network(book, links, machines, many, rows, ip_cols)
     write_ip_map(book, links, nets, ip_cols, owners, gateways, rows, group_colors)
